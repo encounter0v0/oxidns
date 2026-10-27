@@ -41,6 +41,8 @@ import {
   fetchQueryRecorderTimeseries,
   fetchQueryRecorderTopClients,
   fetchQueryRecorderTopQnames,
+  fetchQueryRecorderRcodeDistribution,
+  fetchQueryRecorderQtypeDistribution,
   fetchQueryRecords,
   type QueryRecordRow,
 } from "@/lib/oxidns-api";
@@ -109,69 +111,13 @@ interface LiveQueryLog {
   upstream?: string;
 }
 
-// Refined modern liquid glass palette: 60-30-10 rule with muted semantic indicators
-const DEFAULT_RCODES: RcodeDist[] = [
-  { name: "NOERROR (正常)", value: 71420, color: "#10b981", pct: 72.8 },
-  { name: "NXDOMAIN (无记录)", value: 12540, color: "#64748b", pct: 12.8 },
-  { name: "REFUSED (规则拦截)", value: 13210, color: "#f43f5e", pct: 13.5 },
-  { name: "SERVFAIL (解析异常)", value: 920, color: "#f59e0b", pct: 0.9 },
-];
-
-const DEFAULT_PROTOCOLS: ProtocolDist[] = [
-  { name: "UDP (:53)", value: 68420, pct: 64.5, color: "#0284c7" },
-  { name: "DoH (HTTPS)", value: 24150, pct: 22.8, color: "#64748b" },
-  { name: "TCP (:53)", value: 9810, pct: 9.3, color: "#94a3b8" },
-  { name: "DoT (TLS)", value: 3620, pct: 3.4, color: "#cbd5e1" },
-];
-
-const DEFAULT_QTYPES: QtypeDist[] = [
-  { name: "A (IPv4)", value: 55420, pct: 52.3, color: "#0284c7" },
-  { name: "AAAA (IPv6)", value: 34180, pct: 32.2, color: "#64748b" },
-  { name: "HTTPS / SVCB", value: 11200, pct: 10.6, color: "#94a3b8" },
-  { name: "CNAME", value: 3120, pct: 2.9, color: "#cbd5e1" },
-  { name: "TXT / PTR / SRV", value: 2080, pct: 2.0, color: "#e2e8f0" },
-];
-
-const DEFAULT_UPSTREAMS: UpstreamMetric[] = [
-  {
-    tag: "forward_local",
-    name: "DNSPod DoH (doh.pub)",
-    addr: "https://doh.pub/dns-query",
-    queries: 42150,
-    latencyMs: 3.8,
-    successRate: 99.8,
-  },
-  {
-    tag: "forward_local",
-    name: "AliDNS DoH (alidns.com)",
-    addr: "https://dns.alidns.com/dns-query",
-    queries: 34220,
-    latencyMs: 5.2,
-    successRate: 99.6,
-  },
-  {
-    tag: "forward_local",
-    name: "114 DNS (114.114.114.114)",
-    addr: "114.114.114.114:53",
-    queries: 18450,
-    latencyMs: 8.6,
-    successRate: 99.1,
-  },
-  {
-    tag: "forward_remote",
-    name: "Google DNS (8.8.8.8 Proxy)",
-    addr: "udp://8.8.8.8:53 (SOCKS5)",
-    queries: 9280,
-    latencyMs: 38.5,
-    successRate: 98.4,
-  },
-];
 
 export function DnsOverview() {
   const { formatNumber } = useI18n();
   const trafficMetrics = useAppStore((s) => s.trafficMetrics);
   const health = useAppStore((s) => s.health);
   const plugins = useAppStore((s) => s.plugins);
+  const pluginMetrics = useAppStore((s) => s.pluginMetrics);
   const isConnected = useAuthStore((s) => s.isConnected);
 
   // States
@@ -184,6 +130,8 @@ export function DnsOverview() {
   const [topQueries, setTopQueries] = useState<TopItem[]>([]);
   const [topBlocked, setTopBlocked] = useState<TopItem[]>([]);
   const [liveLogs, setLiveLogs] = useState<LiveQueryLog[]>([]);
+  const [rcodes, setRcodes] = useState<RcodeDist[]>([]);
+  const [qtypes, setQtypes] = useState<QtypeDist[]>([]);
   const [, setCopiedDomain] = useState<string | null>(null);
 
   // Query tester modal / dialog state
@@ -204,6 +152,91 @@ export function DnsOverview() {
     [plugins],
   );
 
+  // Dynamically extract real upstreams configured in user's forward plugins
+  const configuredUpstreams = useMemo<UpstreamMetric[]>(() => {
+    const list: UpstreamMetric[] = [];
+    const forwardPlugins = plugins.filter((p) => p.pluginKind === "forward");
+
+    for (const p of forwardPlugins) {
+      const cfg = p.config as { upstreams?: Array<{ addr?: string; tag?: string } | string> };
+      if (!Array.isArray(cfg?.upstreams)) continue;
+
+      const series = pluginMetrics[p.name] || [];
+
+      for (const u of cfg.upstreams) {
+        const addr = typeof u === "string" ? u : u.addr || "";
+        if (!addr) continue;
+        const tag = typeof u === "object" && u.tag ? u.tag : p.name;
+        const name = typeof u === "object" && u.tag ? `${u.tag} (${addr})` : addr;
+
+        const qSeries = series.find(
+          (s) =>
+            s.name === "forward_upstream_query_total" &&
+            (s.labels.upstream === addr || s.labels.target === addr),
+        );
+        const sSeries = series.find(
+          (s) =>
+            s.name === "forward_upstream_success_total" &&
+            (s.labels.upstream === addr || s.labels.target === addr),
+        );
+        const lSum = series.find(
+          (s) =>
+            s.name === "forward_upstream_latency_sum_ms" &&
+            (s.labels.upstream === addr || s.labels.target === addr),
+        );
+        const lCount = series.find(
+          (s) =>
+            s.name === "forward_upstream_latency_count" &&
+            (s.labels.upstream === addr || s.labels.target === addr),
+        );
+
+        const queries = qSeries?.value ?? 0;
+        const success = sSeries?.value ?? 0;
+        const latencyCount = lCount?.value ?? 0;
+        const latencySum = lSum?.value ?? 0;
+        const latencyMs = latencyCount > 0 ? Number((latencySum / latencyCount).toFixed(1)) : 0;
+        const successRate = queries > 0 ? Number(((success / queries) * 100).toFixed(1)) : 100;
+
+        list.push({
+          tag,
+          name,
+          addr,
+          queries,
+          latencyMs,
+          successRate,
+        });
+      }
+    }
+    return list;
+  }, [plugins, pluginMetrics]);
+
+  // Dynamically extract real server protocols configured in user's config
+  const configuredProtocols = useMemo<ProtocolDist[]>(() => {
+    const serverPlugins = plugins.filter((p) => p.type === "server" || p.pluginKind.endsWith("_server"));
+    const colors = ["#0284c7", "#64748b", "#94a3b8", "#cbd5e1", "#10b981"];
+
+    const items = serverPlugins.map((srv, idx) => {
+      const series = pluginMetrics[srv.name] || [];
+      const reqSeries = series.find((s) => s.name === "server_request_total");
+      const val = reqSeries?.value ?? 0;
+      const protoName = srv.pluginKind.replace(/_server$/, "").toUpperCase();
+      const cfg = srv.config as { listen?: string };
+      const label = `${protoName} (${cfg?.listen || srv.name})`;
+      return {
+        name: label,
+        value: val,
+        color: colors[idx % colors.length],
+      };
+    });
+
+    const totalReq = items.reduce((acc, it) => acc + it.value, 0);
+
+    return items.map((it) => ({
+      ...it,
+      pct: totalReq > 0 ? Number(((it.value / totalReq) * 100).toFixed(1)) : 0,
+    }));
+  }, [plugins, pluginMetrics]);
+
   // Load real telemetry from query_recorder if backend is active
   const loadRecorderData = useCallback(async () => {
     if (!isConnected || !recorderPlugin) {
@@ -212,6 +245,8 @@ export function DnsOverview() {
       setTopQueries([]);
       setTopBlocked([]);
       setLiveLogs([]);
+      setRcodes([]);
+      setQtypes([]);
       return;
     }
     try {
@@ -220,11 +255,13 @@ export function DnsOverview() {
       const bucket = timeRange === "24h" ? "hour" : "minute";
       const buckets = timeRange === "live" ? 24 : timeRange === "1h" ? 20 : 24;
 
-      const [tsRes, clientsRes, qnamesRes, recordsRes] = await Promise.allSettled([
+      const [tsRes, clientsRes, qnamesRes, recordsRes, rcodeRes, qtypeRes] = await Promise.allSettled([
         fetchQueryRecorderTimeseries(tag, { bucket, buckets }),
         fetchQueryRecorderTopClients(tag, { limit: 6 }),
         fetchQueryRecorderTopQnames(tag, { limit: 7 }),
         fetchQueryRecords(tag, { limit: 8 }),
+        fetchQueryRecorderRcodeDistribution(tag),
+        fetchQueryRecorderQtypeDistribution(tag),
       ]);
 
       if (tsRes.status === "fulfilled" && tsRes.value.ok && tsRes.value.points?.length > 0) {
@@ -276,8 +313,9 @@ export function DnsOverview() {
       }
 
       if (recordsRes.status === "fulfilled" && recordsRes.value.ok && recordsRes.value.records?.length > 0) {
+        const records = recordsRes.value.records;
         setLiveLogs(
-          recordsRes.value.records.map((r: QueryRecordRow) => {
+          records.map((r: QueryRecordRow) => {
             const qname = r.questions_json?.[0]?.name || "unknown";
             const qtype = r.questions_json?.[0]?.qtype || "A";
             const isBlocked = r.rcode === "NXDOMAIN" || r.rcode === "REFUSED" || Boolean(r.error);
@@ -295,8 +333,66 @@ export function DnsOverview() {
             };
           }),
         );
+
+        // Derive topBlocked from real blocked query records
+        const blockedRows = records.filter(
+          (r: QueryRecordRow) => r.rcode === "NXDOMAIN" || r.rcode === "REFUSED" || Boolean(r.error),
+        );
+        if (blockedRows.length > 0) {
+          const map: Record<string, number> = {};
+          for (const b of blockedRows) {
+            const name = b.questions_json?.[0]?.name || "unknown";
+            map[name] = (map[name] || 0) + 1;
+          }
+          const sorted = Object.entries(map).sort((a, b) => b[1] - a[1]);
+          setTopBlocked(
+            sorted.slice(0, 7).map(([name, count], idx) => ({
+              rank: idx + 1,
+              name,
+              count,
+              percentage: Number(((count / blockedRows.length) * 100).toFixed(1)),
+              ruleTag: "规则阻断",
+            })),
+          );
+        } else {
+          setTopBlocked([]);
+        }
       } else {
         setLiveLogs([]);
+        setTopBlocked([]);
+      }
+
+      if (rcodeRes.status === "fulfilled" && rcodeRes.value.ok && rcodeRes.value.rows?.length > 0) {
+        const rcodeColors: Record<string, string> = {
+          NOERROR: "#10b981",
+          NXDOMAIN: "#64748b",
+          REFUSED: "#f43f5e",
+          SERVFAIL: "#f59e0b",
+        };
+        setRcodes(
+          rcodeRes.value.rows.map((row) => ({
+            name: row.key,
+            value: row.count,
+            pct: Number((row.share * 100).toFixed(1)),
+            color: rcodeColors[row.key] || "#94a3b8",
+          })),
+        );
+      } else {
+        setRcodes([]);
+      }
+
+      if (qtypeRes.status === "fulfilled" && qtypeRes.value.ok && qtypeRes.value.rows?.length > 0) {
+        const qColors = ["#0284c7", "#64748b", "#94a3b8", "#cbd5e1", "#e2e8f0"];
+        setQtypes(
+          qtypeRes.value.rows.map((row, idx) => ({
+            name: row.key,
+            value: row.count,
+            pct: Number((row.share * 100).toFixed(1)),
+            color: qColors[idx % qColors.length],
+          })),
+        );
+      } else {
+        setQtypes([]);
       }
     } catch {
       // ignore
@@ -325,7 +421,7 @@ export function DnsOverview() {
     if (trafficMetrics?.status === "available" && trafficMetrics.requestTotal > 0) {
       return trafficMetrics.requestTotal;
     }
-    return timeseriesData.reduce((acc, cur) => acc + cur.total, 0) || 128450;
+    return timeseriesData.reduce((acc, cur) => acc + cur.total, 0);
   }, [trafficMetrics, timeseriesData]);
 
   const currentQps = useMemo(() => {
@@ -333,16 +429,56 @@ export function DnsOverview() {
       return Number(trafficMetrics.qps.toFixed(1));
     }
     const lastPoint = timeseriesData[timeseriesData.length - 1];
-    return lastPoint ? lastPoint.qps : 24.5;
+    return lastPoint ? lastPoint.qps : 0;
   }, [trafficMetrics, timeseriesData]);
 
-  const blockCount = useMemo(() => {
-    return Math.round(totalQueries * 0.284);
-  }, [totalQueries]);
-
   const cacheHitCount = useMemo(() => {
-    return Math.round(totalQueries * 0.685);
-  }, [totalQueries]);
+    let hits = 0;
+    for (const series of Object.values(pluginMetrics)) {
+      for (const s of series) {
+        if (s.name === "cache_hit_total" && Number.isFinite(s.value)) {
+          hits += s.value;
+        }
+      }
+    }
+    if (hits > 0) return hits;
+    return timeseriesData.reduce((acc, cur) => acc + cur.cached, 0);
+  }, [pluginMetrics, timeseriesData]);
+
+  const blockCount = useMemo(() => {
+    const refused = rcodes.find((r) => r.name.includes("REFUSED"))?.value || 0;
+    if (refused > 0) return refused;
+    return timeseriesData.reduce((acc, cur) => acc + cur.blocked, 0);
+  }, [rcodes, timeseriesData]);
+
+  const cacheHitRate = useMemo(() => {
+    if (totalQueries <= 0) return 0;
+    return Number(((cacheHitCount / totalQueries) * 100).toFixed(1));
+  }, [totalQueries, cacheHitCount]);
+
+  const blockRate = useMemo(() => {
+    if (totalQueries <= 0) return 0;
+    return Number(((blockCount / totalQueries) * 100).toFixed(1));
+  }, [totalQueries, blockCount]);
+
+  const avgLatency = useMemo(() => {
+    const withLatency = configuredUpstreams.filter((u) => u.latencyMs > 0);
+    if (withLatency.length > 0) {
+      const sum = withLatency.reduce((acc, cur) => acc + cur.latencyMs, 0);
+      return Number((sum / withLatency.length).toFixed(1));
+    }
+    if (liveLogs.length > 0) {
+      const sum = liveLogs.reduce((acc, cur) => acc + cur.latencyMs, 0);
+      return Number((sum / liveLogs.length).toFixed(1));
+    }
+    return 0;
+  }, [configuredUpstreams, liveLogs]);
+
+  const fastestUpstream = useMemo(() => {
+    const valid = configuredUpstreams.filter((u) => u.latencyMs > 0);
+    if (valid.length === 0) return null;
+    return valid.reduce((min, cur) => (cur.latencyMs < min.latencyMs ? cur : min), valid[0]);
+  }, [configuredUpstreams]);
 
   // Handle quick DNS test
   const handleRunTest = (e: React.FormEvent) => {
@@ -477,10 +613,9 @@ export function DnsOverview() {
           <div suppressHydrationWarning className="text-2xl font-bold tracking-tight tabular-nums text-foreground">
             {formatNumber(totalQueries)}
           </div>
-          <div className="flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400 mt-1.5">
-            <TrendingUp className="h-3 w-3" />
-            <span>+14.8%</span>
-            <span className="text-muted-foreground ml-0.5 font-normal">环比增长</span>
+          <div className="flex items-center gap-1 text-[11px] text-muted-foreground mt-1.5">
+            <TrendingUp className="h-3 w-3 text-primary" />
+            <span>累计解析总量</span>
           </div>
         </div>
 
@@ -497,25 +632,27 @@ export function DnsOverview() {
             <span className="text-xs font-normal text-muted-foreground ml-1">req/s</span>
           </div>
           <div className="flex items-center justify-between text-[11px] text-muted-foreground mt-1.5">
-            <span>峰值 86 req/s</span>
-            <span className="text-emerald-600 dark:text-emerald-400 font-medium">平稳</span>
+            <span>吞吐速率</span>
+            <span className={cn("font-medium", currentQps > 0 ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground")}>
+              {currentQps > 0 ? "服务中" : "就绪"}
+            </span>
           </div>
         </div>
 
         {/* Card 3: Threat & Ad Block Rate */}
         <div className="liquid-glass-card p-4 relative overflow-hidden group">
           <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-medium text-muted-foreground">威胁与广告拦截</span>
+            <span className="text-xs font-medium text-muted-foreground">威胁与规则拦截</span>
             <div className="h-7 w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center">
               <ShieldAlert className="h-3.5 w-3.5 text-rose-500" />
             </div>
           </div>
           <div suppressHydrationWarning className="text-2xl font-bold tracking-tight tabular-nums text-foreground">
-            28.4%
+            {blockRate}%
           </div>
           <div className="flex items-center justify-between text-[11px] text-muted-foreground mt-1.5">
             <span suppressHydrationWarning>{formatNumber(blockCount)} 次拦截</span>
-            <span className="text-[10px] font-mono text-muted-foreground">AdGuard</span>
+            <span className="text-[10px] font-mono text-muted-foreground">REFUSED / 阻断</span>
           </div>
         </div>
 
@@ -528,12 +665,14 @@ export function DnsOverview() {
             </div>
           </div>
           <div suppressHydrationWarning className="text-2xl font-bold tracking-tight tabular-nums text-foreground">
-            3.6
-            <span className="text-xs font-normal text-muted-foreground ml-1">ms</span>
+            {avgLatency > 0 ? avgLatency : "-"}
+            {avgLatency > 0 && <span className="text-xs font-normal text-muted-foreground ml-1">ms</span>}
           </div>
           <div className="flex items-center justify-between text-[11px] text-muted-foreground mt-1.5">
-            <span>缓存 &lt;0.2ms</span>
-            <span className="text-emerald-600 dark:text-emerald-400 font-medium">极佳</span>
+            <span>{avgLatency > 0 ? (avgLatency < 10 ? "极佳" : "正常") : "暂无采样"}</span>
+            <span className="text-emerald-600 dark:text-emerald-400 font-medium">
+              {avgLatency > 0 && avgLatency < 20 ? "低延迟" : ""}
+            </span>
           </div>
         </div>
 
@@ -546,11 +685,11 @@ export function DnsOverview() {
             </div>
           </div>
           <div suppressHydrationWarning className="text-2xl font-bold tracking-tight tabular-nums text-foreground">
-            68.5%
+            {cacheHitRate}%
           </div>
           <div className="flex items-center justify-between text-[11px] text-muted-foreground mt-1.5">
             <span suppressHydrationWarning>{formatNumber(cacheHitCount)} 命中</span>
-            <span className="font-mono text-[10px]">8192池</span>
+            <span className="font-mono text-[10px]">本地缓存</span>
           </div>
         </div>
 
@@ -563,11 +702,15 @@ export function DnsOverview() {
             </div>
           </div>
           <div suppressHydrationWarning className="text-2xl font-bold tracking-tight tabular-nums text-foreground">
-            4 / 4
+            {configuredUpstreams.length} <span className="text-xs font-normal text-muted-foreground ml-1">节点</span>
           </div>
           <div className="flex items-center justify-between text-[11px] text-muted-foreground mt-1.5 truncate">
-            <span className="truncate">最快: doh.pub</span>
-            <span className="text-emerald-600 dark:text-emerald-400 font-medium">100%</span>
+            <span className="truncate">
+              {fastestUpstream ? `最快: ${fastestUpstream.tag || fastestUpstream.addr}` : "已接入上游"}
+            </span>
+            <span className="text-emerald-600 dark:text-emerald-400 font-medium font-mono">
+              {fastestUpstream ? `${fastestUpstream.latencyMs}ms` : "-"}
+            </span>
           </div>
         </div>
       </div>
@@ -606,122 +749,134 @@ export function DnsOverview() {
           </div>
         </div>
 
-        <div className="h-72 w-full">
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={timeseriesData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
-              <defs>
-                <linearGradient id="gradientTotal" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#0284c7" stopOpacity={0.12} />
-                  <stop offset="95%" stopColor="#0284c7" stopOpacity={0.0} />
-                </linearGradient>
-                <linearGradient id="gradientCached" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#10b981" stopOpacity={0.06} />
-                  <stop offset="95%" stopColor="#10b981" stopOpacity={0.0} />
-                </linearGradient>
-                <linearGradient id="gradientBlocked" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#f43f5e" stopOpacity={0.05} />
-                  <stop offset="95%" stopColor="#f43f5e" stopOpacity={0.0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid
-                strokeDasharray="3 3"
-                vertical={false}
-                stroke="currentColor"
-                className="text-border/20"
-              />
-              <XAxis
-                dataKey="time"
-                stroke="currentColor"
-                className="text-[11px] text-muted-foreground"
-                tickLine={false}
-                axisLine={false}
-              />
-              <YAxis
-                stroke="currentColor"
-                className="text-[11px] text-muted-foreground"
-                tickLine={false}
-                axisLine={false}
-                tickFormatter={(val) => (val >= 1000 ? `${(val / 1000).toFixed(1)}k` : String(val))}
-              />
-              <Tooltip
-                content={({ active, payload, label }) => {
-                  if (!active || !payload?.length) return null;
-                  return (
-                    <div className="liquid-glass-card p-3 shadow-xl text-xs space-y-1.5 min-w-[170px] border border-border/60">
-                      <div className="font-semibold text-foreground border-b border-border/30 pb-1 flex items-center justify-between">
-                        <span>时间: {label}</span>
-                        <span className="text-[10px] text-muted-foreground font-mono">
-                          QPS: {payload[0]?.payload?.qps}
-                        </span>
+        {timeseriesData.length > 0 ? (
+          <div className="h-72 w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={timeseriesData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="gradientTotal" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#0284c7" stopOpacity={0.12} />
+                    <stop offset="95%" stopColor="#0284c7" stopOpacity={0.0} />
+                  </linearGradient>
+                  <linearGradient id="gradientCached" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#10b981" stopOpacity={0.06} />
+                    <stop offset="95%" stopColor="#10b981" stopOpacity={0.0} />
+                  </linearGradient>
+                  <linearGradient id="gradientBlocked" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#f43f5e" stopOpacity={0.05} />
+                    <stop offset="95%" stopColor="#f43f5e" stopOpacity={0.0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid
+                  strokeDasharray="3 3"
+                  vertical={false}
+                  stroke="currentColor"
+                  className="text-border/20"
+                />
+                <XAxis
+                  dataKey="time"
+                  stroke="currentColor"
+                  className="text-[11px] text-muted-foreground"
+                  tickLine={false}
+                  axisLine={false}
+                />
+                <YAxis
+                  stroke="currentColor"
+                  className="text-[11px] text-muted-foreground"
+                  tickLine={false}
+                  axisLine={false}
+                  tickFormatter={(val) => (val >= 1000 ? `${(val / 1000).toFixed(1)}k` : String(val))}
+                />
+                <Tooltip
+                  content={({ active, payload, label }) => {
+                    if (!active || !payload?.length) return null;
+                    return (
+                      <div className="liquid-glass-card p-3 shadow-xl text-xs space-y-1.5 min-w-[170px] border border-border/60">
+                        <div className="font-semibold text-foreground border-b border-border/30 pb-1 flex items-center justify-between">
+                          <span>时间: {label}</span>
+                          <span className="text-[10px] text-muted-foreground font-mono">
+                            QPS: {payload[0]?.payload?.qps}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="flex items-center gap-1.5 text-muted-foreground">
+                            <span className="h-1.5 w-1.5 rounded-full bg-[#0284c7]" />
+                            总请求:
+                          </span>
+                          <span className="font-bold tabular-nums text-foreground">{payload[0]?.value}</span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="flex items-center gap-1.5 text-muted-foreground">
+                            <span className="h-1.5 w-1.5 rounded-full bg-[#10b981]" />
+                            缓存命中:
+                          </span>
+                          <span className="font-bold tabular-nums text-foreground">{payload[1]?.value}</span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="flex items-center gap-1.5 text-muted-foreground">
+                            <span className="h-1.5 w-1.5 rounded-full bg-[#f43f5e]" />
+                            规则拦截:
+                          </span>
+                          <span className="font-bold tabular-nums text-foreground">{payload[2]?.value}</span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="flex items-center gap-1.5 text-muted-foreground">
+                            <span className="h-1.5 w-1.5 rounded-full bg-[#64748b]" />
+                            上游转发:
+                          </span>
+                          <span className="font-bold tabular-nums text-foreground">{payload[3]?.value}</span>
+                        </div>
                       </div>
-                      <div className="flex items-center justify-between">
-                        <span className="flex items-center gap-1.5 text-muted-foreground">
-                          <span className="h-1.5 w-1.5 rounded-full bg-[#0284c7]" />
-                          总请求:
-                        </span>
-                        <span className="font-bold tabular-nums text-foreground">{payload[0]?.value}</span>
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <span className="flex items-center gap-1.5 text-muted-foreground">
-                          <span className="h-1.5 w-1.5 rounded-full bg-[#10b981]" />
-                          缓存命中:
-                        </span>
-                        <span className="font-bold tabular-nums text-foreground">{payload[1]?.value}</span>
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <span className="flex items-center gap-1.5 text-muted-foreground">
-                          <span className="h-1.5 w-1.5 rounded-full bg-[#f43f5e]" />
-                          规则拦截:
-                        </span>
-                        <span className="font-bold tabular-nums text-foreground">{payload[2]?.value}</span>
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <span className="flex items-center gap-1.5 text-muted-foreground">
-                          <span className="h-1.5 w-1.5 rounded-full bg-[#64748b]" />
-                          上游转发:
-                        </span>
-                        <span className="font-bold tabular-nums text-foreground">{payload[3]?.value}</span>
-                      </div>
-                    </div>
-                  );
-                }}
-              />
-              <Area
-                type="monotone"
-                dataKey="total"
-                stroke="#0284c7"
-                strokeWidth={2}
-                fillOpacity={1}
-                fill="url(#gradientTotal)"
-              />
-              <Area
-                type="monotone"
-                dataKey="cached"
-                stroke="#10b981"
-                strokeWidth={1.5}
-                fillOpacity={1}
-                fill="url(#gradientCached)"
-              />
-              <Area
-                type="monotone"
-                dataKey="blocked"
-                stroke="#f43f5e"
-                strokeWidth={1.5}
-                fillOpacity={1}
-                fill="url(#gradientBlocked)"
-              />
-              <Area
-                type="monotone"
-                dataKey="forwarded"
-                stroke="#64748b"
-                strokeWidth={1.2}
-                strokeDasharray="3 3"
-                fillOpacity={0}
-                fill="transparent"
-              />
-            </AreaChart>
-          </ResponsiveContainer>
-        </div>
+                    );
+                  }}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="total"
+                  stroke="#0284c7"
+                  strokeWidth={2}
+                  fillOpacity={1}
+                  fill="url(#gradientTotal)"
+                />
+                <Area
+                  type="monotone"
+                  dataKey="cached"
+                  stroke="#10b981"
+                  strokeWidth={1.5}
+                  fillOpacity={1}
+                  fill="url(#gradientCached)"
+                />
+                <Area
+                  type="monotone"
+                  dataKey="blocked"
+                  stroke="#f43f5e"
+                  strokeWidth={1.5}
+                  fillOpacity={1}
+                  fill="url(#gradientBlocked)"
+                />
+                <Area
+                  type="monotone"
+                  dataKey="forwarded"
+                  stroke="#64748b"
+                  strokeWidth={1.2}
+                  strokeDasharray="3 3"
+                  fillOpacity={0}
+                  fill="transparent"
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+        ) : (
+          <div className="h-64 flex flex-col items-center justify-center text-center p-6 text-xs text-muted-foreground">
+            <BarChart3 className="h-10 w-10 text-muted-foreground/30 mb-2" />
+            <span className="font-medium text-foreground">暂无实时流量趋势数据</span>
+            <span className="text-[11px] text-muted-foreground mt-1">
+              {recorderPlugin
+                ? "正在等待 DNS 查询流量汇入..."
+                : "在 config.yaml 主流水线中配置 query_recorder 插件即可开启流量趋势与时序图表分析"}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* ── Chart Section 2: Distribution Row (2 Columns) ── */}
@@ -734,65 +889,79 @@ export function DnsOverview() {
                 <PieChartIcon className="h-4 w-4 text-primary" />
                 <h3 className="text-sm font-semibold text-foreground">DNS 解析状态分布 (RCODE)</h3>
               </div>
-              <span className="liquid-glass-pill bg-foreground/[0.04] text-muted-foreground text-[11px] border border-foreground/[0.08]">
-                98.2% 正常服务率
-              </span>
+              {rcodes.length > 0 && (
+                <span className="liquid-glass-pill bg-foreground/[0.04] text-muted-foreground text-[11px] border border-foreground/[0.08]">
+                  {rcodes.find((r) => r.name.includes("NOERROR"))?.pct ?? 100}% 正常服务率
+                </span>
+              )}
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 items-center gap-4">
-              <div className="h-48 relative flex items-center justify-center">
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie
-                      data={DEFAULT_RCODES}
-                      cx="50%"
-                      cy="50%"
-                      innerRadius={58}
-                      outerRadius={80}
-                      paddingAngle={3}
-                      dataKey="value"
-                    >
-                      {DEFAULT_RCODES.map((entry, index) => (
-                        <Cell key={`cell-${index}`} fill={entry.color} />
-                      ))}
-                    </Pie>
-                    <Tooltip
-                      content={({ active, payload }) => {
-                        if (!active || !payload?.length) return null;
-                        const data = payload[0].payload as RcodeDist;
-                        return (
-                          <div className="liquid-glass-card p-2 text-xs shadow-md border border-border/50">
-                            <span className="font-semibold text-foreground">{data.name}</span>:{" "}
-                            {formatNumber(data.value)} ({data.pct}%)
-                          </div>
-                        );
-                      }}
-                    />
-                  </PieChart>
-                </ResponsiveContainer>
-                {/* Center Badge */}
-                <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-                  <span className="text-xl font-bold font-mono text-foreground">98.2%</span>
-                  <span className="text-[10px] text-muted-foreground">正常率</span>
+            {rcodes.length > 0 ? (
+              <div className="grid grid-cols-1 sm:grid-cols-2 items-center gap-4">
+                <div className="h-48 relative flex items-center justify-center">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={rcodes}
+                        cx="50%"
+                        cy="50%"
+                        innerRadius={58}
+                        outerRadius={80}
+                        paddingAngle={3}
+                        dataKey="value"
+                      >
+                        {rcodes.map((entry, index) => (
+                          <Cell key={`cell-${index}`} fill={entry.color} />
+                        ))}
+                      </Pie>
+                      <Tooltip
+                        content={({ active, payload }) => {
+                          if (!active || !payload?.length) return null;
+                          const data = payload[0].payload as RcodeDist;
+                          return (
+                            <div className="liquid-glass-card p-2 text-xs shadow-md border border-border/50">
+                              <span className="font-semibold text-foreground">{data.name}</span>:{" "}
+                              {formatNumber(data.value)} ({data.pct}%)
+                            </div>
+                          );
+                        }}
+                      />
+                    </PieChart>
+                  </ResponsiveContainer>
+                  {/* Center Badge */}
+                  <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+                    <span className="text-xl font-bold font-mono text-foreground">
+                      {rcodes.find((r) => r.name.includes("NOERROR"))?.pct ?? 100}%
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">正常率</span>
+                  </div>
+                </div>
+
+                {/* Legend List */}
+                <div className="space-y-2.5">
+                  {rcodes.map((rc) => (
+                    <div key={rc.name} className="flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: rc.color }} />
+                        <span className="truncate text-foreground/90">{rc.name}</span>
+                      </div>
+                      <div className="flex items-center gap-2 font-mono tabular-nums">
+                        <span className="text-muted-foreground">{formatNumber(rc.value)}</span>
+                        <span className="font-medium text-foreground min-w-[38px] text-right">{rc.pct}%</span>
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
-
-              {/* Legend List */}
-              <div className="space-y-2.5">
-                {DEFAULT_RCODES.map((rc) => (
-                  <div key={rc.name} className="flex items-center justify-between text-xs">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: rc.color }} />
-                      <span className="truncate text-foreground/90">{rc.name}</span>
-                    </div>
-                    <div className="flex items-center gap-2 font-mono tabular-nums">
-                      <span className="text-muted-foreground">{formatNumber(rc.value)}</span>
-                      <span className="font-medium text-foreground min-w-[38px] text-right">{rc.pct}%</span>
-                    </div>
-                  </div>
-                ))}
+            ) : (
+              <div className="h-48 flex flex-col items-center justify-center text-center p-4 text-xs text-muted-foreground">
+                <PieChartIcon className="h-8 w-8 text-muted-foreground/30 mb-2" />
+                <span>暂无 RCODE 状态分布数据</span>
+                <span className="text-[11px] text-muted-foreground/60 mt-0.5">
+                  在主流程中启用 query_recorder 插件后可自动收集
+                </span>
               </div>
-            </div>
+            )}
           </div>
         </div>
 
@@ -833,53 +1002,70 @@ export function DnsOverview() {
             {/* Content for Active Tab */}
             {activeDistTab === "protocol" ? (
               <div className="space-y-3 pt-1">
-                {DEFAULT_PROTOCOLS.map((p) => (
-                  <div key={p.name} className="space-y-1">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-medium flex items-center gap-1.5 text-foreground">
-                        <span className="h-2 w-2 rounded-full" style={{ backgroundColor: p.color }} />
-                        {p.name}
-                      </span>
-                      <span className="font-mono tabular-nums text-muted-foreground">
-                        {formatNumber(p.value)} ({p.pct}%)
-                      </span>
+                {configuredProtocols.length > 0 ? (
+                  configuredProtocols.map((p) => (
+                    <div key={p.name} className="space-y-1">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="font-medium flex items-center gap-1.5 text-foreground">
+                          <span className="h-2 w-2 rounded-full" style={{ backgroundColor: p.color }} />
+                          {p.name}
+                        </span>
+                        <span className="font-mono tabular-nums text-muted-foreground">
+                          {formatNumber(p.value)} ({p.pct}%)
+                        </span>
+                      </div>
+                      <div className="h-2 w-full rounded-full bg-foreground/[0.05] overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all duration-500"
+                          style={{
+                            width: `${p.pct}%`,
+                            backgroundColor: p.color,
+                          }}
+                        />
+                      </div>
                     </div>
-                    <div className="h-2 w-full rounded-full bg-foreground/[0.05] overflow-hidden">
-                      <div
-                        className="h-full rounded-full transition-all duration-500"
-                        style={{
-                          width: `${p.pct}%`,
-                          backgroundColor: p.color,
-                        }}
-                      />
-                    </div>
+                  ))
+                ) : (
+                  <div className="h-40 flex flex-col items-center justify-center text-center p-4 text-xs text-muted-foreground">
+                    <Layers className="h-8 w-8 text-muted-foreground/30 mb-2" />
+                    <span>暂无监听服务协议</span>
                   </div>
-                ))}
+                )}
               </div>
             ) : (
               <div className="space-y-3 pt-1">
-                {DEFAULT_QTYPES.map((q) => (
-                  <div key={q.name} className="space-y-1">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-medium flex items-center gap-1.5 text-foreground">
-                        <span className="h-2 w-2 rounded-full" style={{ backgroundColor: q.color }} />
-                        {q.name}
-                      </span>
-                      <span className="font-mono tabular-nums text-muted-foreground">
-                        {formatNumber(q.value)} ({q.pct}%)
-                      </span>
+                {qtypes.length > 0 ? (
+                  qtypes.map((q) => (
+                    <div key={q.name} className="space-y-1">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="font-medium flex items-center gap-1.5 text-foreground">
+                          <span className="h-2 w-2 rounded-full" style={{ backgroundColor: q.color }} />
+                          {q.name}
+                        </span>
+                        <span className="font-mono tabular-nums text-muted-foreground">
+                          {formatNumber(q.value)} ({q.pct}%)
+                        </span>
+                      </div>
+                      <div className="h-2 w-full rounded-full bg-foreground/[0.05] overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all duration-500"
+                          style={{
+                            width: `${q.pct}%`,
+                            backgroundColor: q.color,
+                          }}
+                        />
+                      </div>
                     </div>
-                    <div className="h-2 w-full rounded-full bg-foreground/[0.05] overflow-hidden">
-                      <div
-                        className="h-full rounded-full transition-all duration-500"
-                        style={{
-                          width: `${q.pct}%`,
-                          backgroundColor: q.color,
-                        }}
-                      />
-                    </div>
+                  ))
+                ) : (
+                  <div className="h-40 flex flex-col items-center justify-center text-center p-4 text-xs text-muted-foreground">
+                    <Layers className="h-8 w-8 text-muted-foreground/30 mb-2" />
+                    <span>暂无 QType 记录分布</span>
+                    <span className="text-[11px] text-muted-foreground/60 mt-0.5">
+                      在主流程中启用 query_recorder 插件后可自动统计
+                    </span>
                   </div>
-                ))}
+                )}
               </div>
             )}
           </div>
@@ -895,58 +1081,71 @@ export function DnsOverview() {
               <h2 className="text-base font-semibold text-foreground">上游 DNS 节点性能与响应延迟</h2>
             </div>
             <p className="text-xs text-muted-foreground mt-0.5">
-              各配置上游（国内公共 DNS、DoH、海外备用代理）的解析承载量与实测延迟对比
+              各配置上游（来自 forward 插件的 upstreams 配置）的解析承载量与实测延迟对比
             </p>
           </div>
           <span className="liquid-glass-pill bg-foreground/[0.04] text-muted-foreground text-xs border border-foreground/[0.08]">
-            负载均衡: Balanced
+            已配置节点: {configuredUpstreams.length} 个
           </span>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3.5">
-          {DEFAULT_UPSTREAMS.map((ups) => (
-            <div
-              key={ups.name}
-              className="p-3.5 rounded-xl border border-border/40 bg-foreground/[0.02] hover:bg-foreground/[0.04] transition-all space-y-2.5"
-            >
-              <div className="flex items-start justify-between">
-                <div>
-                  <h4 className="text-xs font-semibold text-foreground truncate max-w-[160px]" title={ups.name}>
-                    {ups.name}
-                  </h4>
-                  <p className="text-[11px] text-muted-foreground font-mono truncate max-w-[160px]" title={ups.addr}>
-                    {ups.addr}
-                  </p>
-                </div>
-                <span
-                  className={cn(
-                    "text-[10px] px-1.5 py-0.5 rounded-md font-mono font-medium border",
-                    ups.latencyMs < 10
-                      ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20"
-                      : "bg-foreground/[0.04] text-muted-foreground border-foreground/[0.08]",
-                  )}
+        {configuredUpstreams.length > 0 ? (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3.5">
+            {configuredUpstreams.map((ups) => {
+              const maxQ = Math.max(1, ...configuredUpstreams.map((u) => u.queries));
+              return (
+                <div
+                  key={`${ups.tag}-${ups.addr}`}
+                  className="p-3.5 rounded-xl border border-border/40 bg-foreground/[0.02] hover:bg-foreground/[0.04] transition-all space-y-2.5"
                 >
-                  {ups.latencyMs} ms
-                </span>
-              </div>
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <h4 className="text-xs font-semibold text-foreground truncate max-w-[160px]" title={ups.name}>
+                        {ups.name}
+                      </h4>
+                      <p className="text-[11px] text-muted-foreground font-mono truncate max-w-[160px]" title={ups.addr}>
+                        {ups.addr}
+                      </p>
+                    </div>
+                    <span
+                      className={cn(
+                        "text-[10px] px-1.5 py-0.5 rounded-md font-mono font-medium border",
+                        ups.latencyMs > 0 && ups.latencyMs < 15
+                          ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20"
+                          : "bg-foreground/[0.04] text-muted-foreground border-foreground/[0.08]",
+                      )}
+                    >
+                      {ups.latencyMs > 0 ? `${ups.latencyMs} ms` : "-"}
+                    </span>
+                  </div>
 
-              <div className="space-y-1">
-                <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-                  <span>处理量: {formatNumber(ups.queries)}</span>
-                  <span>成功率: {ups.successRate}%</span>
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                      <span>处理量: {formatNumber(ups.queries)}</span>
+                      <span>成功率: {ups.queries > 0 ? `${ups.successRate}%` : "-"}</span>
+                    </div>
+                    <div className="h-1.5 w-full rounded-full bg-foreground/[0.06] overflow-hidden">
+                      <div
+                        className="h-full rounded-full bg-primary"
+                        style={{
+                          width: `${Math.min(100, (ups.queries / maxQ) * 100)}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
                 </div>
-                <div className="h-1.5 w-full rounded-full bg-foreground/[0.06] overflow-hidden">
-                  <div
-                    className="h-full rounded-full bg-primary"
-                    style={{
-                      width: `${Math.min(100, (ups.queries / 45000) * 100)}%`,
-                    }}
-                  />
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="p-8 text-center rounded-xl border border-dashed border-border/60 bg-foreground/[0.01]">
+            <Globe className="h-8 w-8 mx-auto text-muted-foreground/30 mb-2" />
+            <p className="text-xs font-medium text-foreground">暂未检测到配置的上游 DNS 节点</p>
+            <p className="text-[11px] text-muted-foreground mt-1">
+              请检查 config.yaml 中是否配置了 forward 插件并声明了 upstreams 列表
+            </p>
+          </div>
+        )}
       </div>
 
       {/* ── Section 4: Rankings & Tables (Top Domains & Clients) ── */}
