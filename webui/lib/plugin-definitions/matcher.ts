@@ -1,0 +1,493 @@
+import type { PluginKindDefinition, PluginMetricsDef } from "./shared";
+import {
+  inputArrayItem,
+  matcherListField,
+  providerReferenceArrayItem,
+  stringArrayField,
+} from "./shared";
+
+export const matcherPluginDefinitions: PluginKindDefinition[] = [
+  {
+    kind: "any_match",
+    type: "matcher",
+    name: "Any Match",
+    description: "组合多个 matcher，任意一个命中即返回 true",
+    icon: "List",
+    configSchema: [matcherListField()],
+  },
+  {
+    kind: "qname",
+    type: "matcher",
+    name: "QName",
+    description: "匹配请求中的查询域名",
+    icon: "Regex",
+    configSchema: [
+      stringArrayField(
+        "args",
+        "域名规则",
+        "full:login.example.com\ndomain:example.com\nkeyword:cdn\nregexp:^api[0-9]+\\.example\\.net$\n$core_domains\n&/etc/oxidns/domains.txt",
+        true,
+        "定义域名匹配规则来源。",
+        undefined,
+        [
+          providerReferenceArrayItem("core_domains"),
+          inputArrayItem("regexp:^api[0-9]+\\.example\\.net$"),
+        ],
+      ),
+    ],
+    quickSetup: {
+      paramPlaceholder: "$domain_set",
+      paramReferenceTypes: ["provider"],
+    },
+  },
+  {
+    kind: "question",
+    type: "matcher",
+    name: "Question",
+    description: "按 provider 的 contains_question 语义匹配请求 question",
+    icon: "FileQuestion",
+    configSchema: [
+      stringArrayField(
+        "args",
+        "Provider 引用",
+        "$ad_rules\n$shared_domains",
+        true,
+        "使用 $provider_tag 形式引用实现了 contains_question 的 provider。",
+        {
+          type: "reference",
+          label: "引用 provider",
+          referenceTypes: ["provider"],
+          referencePrefix: "$",
+          example: "ad_rules",
+        },
+      ),
+    ],
+    quickSetup: {
+      paramPlaceholder: "$ad_rules",
+      paramReferenceTypes: ["provider"],
+    },
+  },
+  {
+    kind: "qtype",
+    type: "matcher",
+    name: "QType",
+    description: "匹配请求 qtype",
+    icon: "FileQuestion",
+    configSchema: [
+      stringArrayField(
+        "args",
+        "QType 文本或数值",
+        "A\nAAAA\n1\n28",
+        true,
+        "定义允许命中的查询类型集合，同时支持 A/AAAA 等文本和对应数值。",
+      ),
+    ],
+    quickSetup: {
+      paramPlaceholder: "A,AAAA 或 1,28",
+    },
+  },
+  {
+    kind: "qclass",
+    type: "matcher",
+    name: "QClass",
+    description: "匹配请求 qclass",
+    icon: "FileQuestion",
+    configSchema: [
+      stringArrayField(
+        "args",
+        "QClass 文本或数值",
+        "IN\n1",
+        true,
+        "定义允许命中的查询类别集合，同时支持 IN/CH 等文本和对应数值。",
+      ),
+    ],
+    quickSetup: {
+      paramPlaceholder: "IN 或 1",
+    },
+  },
+  {
+    kind: "client_ip",
+    type: "matcher",
+    name: "Client IP",
+    description: "匹配客户端来源 IP",
+    icon: "MapPin",
+    configSchema: [
+      stringArrayField(
+        "args",
+        "IP / CIDR / ip_set",
+        "192.168.0.0/16\n$lan_ip_set",
+        true,
+        "定义客户端来源地址匹配条件。",
+        undefined,
+        [
+          providerReferenceArrayItem("lan_ip_set"),
+          inputArrayItem("192.168.0.0/16"),
+        ],
+      ),
+    ],
+    quickSetup: {
+      paramPlaceholder: "$lan_ip_set",
+      paramReferenceTypes: ["provider"],
+    },
+  },
+  {
+    kind: "resp_ip",
+    type: "matcher",
+    name: "Response IP",
+    description: "匹配响应 answers 中的 A/AAAA IP",
+    icon: "MapPin",
+    configSchema: [
+      stringArrayField(
+        "args",
+        "IP / CIDR / ip_set",
+        "100.64.0.0/10\n$special_targets",
+        true,
+        "定义应答地址匹配条件。",
+        undefined,
+        [
+          providerReferenceArrayItem("special_targets"),
+          inputArrayItem("100.64.0.0/10"),
+        ],
+      ),
+    ],
+    quickSetup: {
+      paramPlaceholder: "$ip_set",
+      paramReferenceTypes: ["provider"],
+    },
+  },
+  {
+    kind: "ptr_ip",
+    type: "matcher",
+    name: "PTR IP",
+    description: "从 PTR 请求名解析 IP 后匹配",
+    icon: "MapPin",
+    configSchema: [
+      stringArrayField(
+        "args",
+        "IP / CIDR / ip_set",
+        "192.168.0.0/16\n$lan_ip_set",
+        true,
+        "定义 PTR 反查地址匹配条件。",
+        undefined,
+        [
+          providerReferenceArrayItem("lan_ip_set"),
+          inputArrayItem("192.168.0.0/16"),
+        ],
+      ),
+    ],
+    quickSetup: {
+      paramPlaceholder: "$lan_ip_set",
+      paramReferenceTypes: ["provider"],
+    },
+  },
+  {
+    kind: "cname",
+    type: "matcher",
+    name: "CNAME",
+    description: "匹配响应中的 CNAME 目标域名",
+    icon: "Regex",
+    configSchema: [
+      stringArrayField(
+        "args",
+        "CNAME 规则",
+        "full:alias.example.com\ndomain:example.com\nkeyword:cdn\nregexp:^edge[0-9]+\\.example\\.net$\n$core_domains\n&/etc/oxidns/cnames.txt",
+        true,
+        "定义响应 CNAME 目标域名匹配规则来源。",
+        undefined,
+        [
+          providerReferenceArrayItem("core_domains"),
+          inputArrayItem("regexp:^edge[0-9]+\\.example\\.net$"),
+        ],
+      ),
+    ],
+    quickSetup: {
+      paramPlaceholder: "$domain_set",
+      paramReferenceTypes: ["provider"],
+    },
+  },
+  {
+    kind: "rcode",
+    type: "matcher",
+    name: "RCode",
+    description: "匹配当前响应 rcode",
+    icon: "FileQuestion",
+    configSchema: [
+      stringArrayField(
+        "args",
+        "RCode 文本或数值",
+        "NOERROR\nSERVFAIL\nNXDOMAIN\n0\n2\n3",
+        true,
+        "定义允许命中的响应码集合，同时支持 SERVFAIL/NXDOMAIN 等文本和对应数值。",
+      ),
+    ],
+    quickSetup: {
+      paramPlaceholder: "SERVFAIL,NXDOMAIN 或 2,3",
+    },
+  },
+  {
+    kind: "has_resp",
+    type: "matcher",
+    name: "Has Response",
+    description: "上下文中已有响应时命中",
+    icon: "CheckCircle",
+    configSchema: [],
+    quickSetup: {},
+  },
+  {
+    kind: "has_wanted_ans",
+    type: "matcher",
+    name: "Has Wanted Answer",
+    description: "响应 answers 中包含请求 qtype 对应记录时命中",
+    icon: "CheckCircle",
+    configSchema: [],
+    quickSetup: {},
+  },
+  {
+    kind: "mark",
+    type: "matcher",
+    name: "Mark",
+    description: "匹配上下文中的 mark 集合",
+    icon: "Hash",
+    configSchema: [
+      stringArrayField(
+        "args",
+        "Mark",
+        "100\n200",
+        true,
+        "定义允许命中的 mark 集合。",
+      ),
+    ],
+    quickSetup: {
+      paramPlaceholder: "100,200",
+    },
+  },
+  {
+    kind: "env",
+    type: "matcher",
+    name: "Env",
+    description: "匹配进程环境变量",
+    icon: "Settings",
+    configSchema: [
+      stringArrayField(
+        "args",
+        "环境变量条件",
+        "PROFILE=prod\nFEATURE_X",
+        true,
+        "定义需要同时满足的环境变量条件。",
+      ),
+    ],
+    quickSetup: {
+      paramPlaceholder: "PROFILE=prod FEATURE_X",
+    },
+  },
+  {
+    kind: "random",
+    type: "matcher",
+    name: "Random",
+    description: "按概率命中",
+    icon: "Shuffle",
+    configSchema: [
+      stringArrayField("args", "概率", "0.1", true, "定义 matcher 命中概率。"),
+    ],
+    quickSetup: {
+      paramPlaceholder: "0.1",
+    },
+  },
+  {
+    kind: "time",
+    type: "matcher",
+    name: "Time",
+    description: "按时区、时间段、星期和每月日期匹配",
+    icon: "Clock",
+    configSchema: [
+      {
+        key: "timezone",
+        label: "时区",
+        type: "text",
+        example: "Asia/Shanghai",
+        advanced: true,
+        description:
+          "留空时使用系统时区；填写有效 IANA 时区可固定策略判断时区。",
+      },
+      {
+        key: "periods",
+        label: "时间周期",
+        type: "array",
+        required: true,
+        example:
+          '[{"start":"09:00","end":"18:00","weekdays":["mon","tue","wed","thu","fri"]}]',
+        description:
+          "任一周期命中即返回 true；同一周期内的时间、星期和月日条件需要同时满足。",
+        item: {
+          type: "object",
+          label: "时间周期",
+          summaryFields: ["start", "end", "weekdays", "monthdays"],
+          fields: [
+            {
+              key: "start",
+              label: "开始时间",
+              type: "time",
+              example: "09:00",
+              description: "使用 HH:MM；与结束时间同时填写。",
+              timeRange: {
+                id: "period-time-range",
+                role: "start",
+                defaultValue: "09:00",
+              },
+            },
+            {
+              key: "end",
+              label: "结束时间",
+              type: "time",
+              example: "18:00",
+              description: "使用 HH:MM；早于开始时间时表示跨午夜。",
+              timeRange: {
+                id: "period-time-range",
+                role: "end",
+                defaultValue: "18:00",
+              },
+            },
+            {
+              key: "weekdays",
+              label: "星期",
+              type: "array",
+              example: "mon\ntue\nwed\nthu\nfri",
+              description: "默认每天；使用 ISO 周序 1（周一）到 7（周日）。",
+              arrayPresentation: "weekday-chips",
+              item: {
+                type: "select",
+                options: [
+                  { label: "周一", value: 1, aliases: ["mon"] },
+                  { label: "周二", value: 2, aliases: ["tue"] },
+                  { label: "周三", value: 3, aliases: ["wed"] },
+                  { label: "周四", value: 4, aliases: ["thu"] },
+                  { label: "周五", value: 5, aliases: ["fri"] },
+                  { label: "周六", value: 6, aliases: ["sat"] },
+                  { label: "周日", value: 7, aliases: ["sun"] },
+                ],
+              },
+            },
+            {
+              key: "monthdays",
+              label: "每月日期",
+              type: "array",
+              example: "1\n15",
+              description: "默认不限日期；选择指定日期后可勾选 1 到 31。",
+              arrayPresentation: "calendar-grid",
+              item: {
+                type: "number",
+                example: "1",
+                options: Array.from({ length: 31 }, (_, index) => ({
+                  label: String(index + 1),
+                  value: index + 1,
+                })),
+              },
+            },
+          ],
+        },
+      },
+    ],
+    quickSetup: {
+      paramPlaceholder: "09:00-18:00",
+    },
+  },
+  {
+    kind: "rate_limiter",
+    type: "matcher",
+    name: "Rate Limiter",
+    description: "基于客户端 IP 的令牌桶限流",
+    icon: "Gauge",
+    metrics: {
+      metricLabels: {
+        ratelimit_allowed_total: "放行",
+        ratelimit_rejected_total: "限流拒绝",
+      },
+      metricHelp: {
+        ratelimit_allowed_total: "通过限流检查（令牌充足）的匹配总次数。",
+        ratelimit_rejected_total: "因令牌耗尽而被限流拒绝的匹配总次数。",
+      },
+      cardPriority: ["ratelimit_allowed_total", "ratelimit_rejected_total"],
+      derivedCard: [
+        {
+          kind: "percent_of_sum",
+          numerator: "ratelimit_rejected_total",
+          terms: ["ratelimit_rejected_total", "ratelimit_allowed_total"],
+          label: "拒绝率",
+        },
+      ],
+    } satisfies PluginMetricsDef,
+    configSchema: [
+      {
+        key: "qps",
+        description: "定义每秒令牌补充速率。",
+        label: "QPS",
+        type: "number",
+        default: 20,
+      },
+      {
+        key: "burst",
+        description: "定义令牌桶容量上限。",
+        label: "突发容量",
+        type: "number",
+        default: 40,
+      },
+      {
+        key: "mask4",
+        description: "定义 IPv4 客户端聚合粒度。",
+        label: "IPv4 聚合前缀",
+        type: "number",
+        default: 32,
+        advanced: true,
+      },
+      {
+        key: "mask6",
+        description: "定义 IPv6 客户端聚合粒度。",
+        label: "IPv6 聚合前缀",
+        type: "number",
+        default: 48,
+        advanced: true,
+      },
+    ],
+    quickSetup: {
+      paramPlaceholder: "20 40",
+    },
+  },
+  {
+    kind: "string_exp",
+    type: "matcher",
+    name: "String Expression",
+    description: "通用字符串表达式匹配器",
+    icon: "Regex",
+    configSchema: [
+      {
+        key: "args",
+        description: "通用字符串表达式匹配器表达式。",
+        label: "表达式",
+        type: "text",
+        required: true,
+        example: "url_path prefix /dns-",
+      },
+    ],
+    quickSetup: {
+      paramPlaceholder: "url_path prefix /dns-",
+    },
+  },
+  {
+    kind: "_true",
+    type: "matcher",
+    name: "Always True",
+    description: "恒为真，可作为保底命中条件",
+    icon: "CheckCircle",
+    configSchema: [],
+    quickSetup: {},
+  },
+  {
+    kind: "_false",
+    type: "matcher",
+    name: "Always False",
+    description: "恒为假，可用于临时禁用某条规则",
+    icon: "Ban",
+    configSchema: [],
+    quickSetup: {},
+  },
+];

@@ -1,0 +1,229 @@
+// SPDX-FileCopyrightText: 2025 Sven Shi
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! Unified error handling module for OxiDNS
+//!
+//! Provides a centralized error type that can represent various error
+//! conditions throughout the application, making error handling more consistent
+//! and easier to maintain.
+
+use oxidns_proto::ProtoError;
+use thiserror::Error;
+
+use crate::config::types::ConfigError;
+
+/// Main error type for OxiDNS
+///
+/// This enum represents all possible errors that can occur in the application.
+/// It can be constructed from various error types using the `From` trait
+/// implementations.
+#[derive(Debug, Error)]
+pub enum DnsError {
+    /// I/O operation failed
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// YAML parsing or serialization failed
+    #[error("YAML error: {0}")]
+    Yaml(#[from] serde_yaml_ng::Error),
+
+    /// Configuration validation error
+    #[error("Configuration error: {0}")]
+    Config(String),
+
+    /// Plugin initialization or operation error
+    #[error("Plugin error: {0}")]
+    Plugin(String),
+
+    /// Network address parsing error
+    #[error("Address parse error: {0}")]
+    AddrParse(#[from] std::net::AddrParseError),
+
+    /// Tokio runtime error
+    #[error("Runtime error: {0}")]
+    Runtime(String),
+
+    /// Dependency resolution error
+    #[error("Dependency error: {0}")]
+    Dependency(String),
+
+    /// DNS protocol error
+    #[error("DNS protocol error: {0}")]
+    Protocol(String),
+
+    /// Quic connect error
+    #[cfg(any(
+        feature = "server-doq",
+        feature = "server-doh3",
+        feature = "_dns-client-doq",
+        feature = "_dns-client-doh3"
+    ))]
+    #[error("quic connect error: {0}")]
+    QuicConnectError(#[from] quinn::ConnectError),
+
+    /// No initial cipher error
+    #[cfg(any(
+        feature = "server-doq",
+        feature = "server-doh3",
+        feature = "_dns-client-doq",
+        feature = "_dns-client-doh3"
+    ))]
+    #[error("No initial cipher error: {0}")]
+    NoInitialCipherSuiteError(#[from] quinn::crypto::rustls::NoInitialCipherSuite),
+
+    /// An unknown dns class was found
+    #[error("dns class string unknown: {0}")]
+    UnknownDnsClassStr(String),
+
+    /// An unknown record type string was found
+    #[error("record type string unknown: {0}")]
+    UnknownRecordTypeStr(String),
+
+    #[cfg(any(
+        feature = "server-doq",
+        feature = "server-doh3",
+        feature = "_dns-client-doq",
+        feature = "_dns-client-doh3"
+    ))]
+    #[error("integer bounds exceeded error: {0}")]
+    VarIntBoundsExceeded(#[from] quinn::VarIntBoundsExceeded),
+
+    /// socks5 connect error
+    #[error("Socks5 error: {0}")]
+    SocksError(#[from] fast_socks5::SocksError),
+
+    /// wincode write error
+    #[error("wincode write error: {0}")]
+    WinCodeWriteError(#[from] wincode::WriteError),
+
+    /// wincode read error
+    #[error("wincode read error: {0}")]
+    WinCodeReadError(#[from] wincode::ReadError),
+
+    /// rusqlite error
+    #[cfg(feature = "plugin-query-recorder")]
+    #[error("rusqlite error: {0}")]
+    Rusqlite(#[from] rusqlite::Error),
+
+    /// serde json error
+    #[error("serde json error: {0}")]
+    SerdeJson(#[from] serde_json::Error),
+
+    /// Generic error with custom message
+    #[error("{0}")]
+    Generic(String),
+}
+
+#[allow(unused)]
+impl DnsError {
+    /// Create a configuration error
+    pub fn config<S: Into<String>>(msg: S) -> Self {
+        DnsError::Config(msg.into())
+    }
+
+    /// Create a plugin error
+    pub fn plugin<S: Into<String>>(msg: S) -> Self {
+        DnsError::Plugin(msg.into())
+    }
+
+    /// Create a runtime error
+    pub fn runtime<S: Into<String>>(msg: S) -> Self {
+        DnsError::Runtime(msg.into())
+    }
+
+    /// Create a dependency error
+    pub fn dependency<S: Into<String>>(msg: S) -> Self {
+        DnsError::Dependency(msg.into())
+    }
+
+    /// Create a protocol error
+    pub fn protocol<S: Into<String>>(msg: S) -> Self {
+        DnsError::Protocol(msg.into())
+    }
+}
+
+/// Allow conversion from String to DnsError
+impl From<String> for DnsError {
+    fn from(s: String) -> Self {
+        DnsError::Generic(s)
+    }
+}
+
+/// Allow conversion from &str to DnsError
+impl From<&str> for DnsError {
+    fn from(s: &str) -> Self {
+        DnsError::Generic(s.to_string())
+    }
+}
+
+/// Allow conversion from ConfigError to DnsError
+impl From<ConfigError> for DnsError {
+    fn from(e: ConfigError) -> Self {
+        DnsError::Config(e.to_string())
+    }
+}
+
+impl From<ProtoError> for DnsError {
+    fn from(value: ProtoError) -> Self {
+        match value {
+            ProtoError::Io(error) => Self::Io(error),
+            ProtoError::Protocol(message) => Self::Protocol(message),
+            ProtoError::UnknownDnsClassStr(value) => Self::UnknownDnsClassStr(value),
+            ProtoError::UnknownRecordTypeStr(value) => Self::UnknownRecordTypeStr(value),
+        }
+    }
+}
+
+/// Convenient type alias for Results using DnsError
+pub type Result<T> = std::result::Result<T, DnsError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::ConfigError;
+
+    #[test]
+    fn test_helper_constructors_return_expected_variants() {
+        assert!(matches!(
+            DnsError::config("bad config"),
+            DnsError::Config(_)
+        ));
+        assert!(matches!(
+            DnsError::plugin("bad plugin"),
+            DnsError::Plugin(_)
+        ));
+        assert!(matches!(
+            DnsError::runtime("bad runtime"),
+            DnsError::Runtime(_)
+        ));
+        assert!(matches!(
+            DnsError::dependency("bad dependency"),
+            DnsError::Dependency(_)
+        ));
+        assert!(matches!(
+            DnsError::protocol("bad protocol"),
+            DnsError::Protocol(_)
+        ));
+    }
+
+    #[test]
+    fn test_from_string_and_str_create_generic_error() {
+        assert!(matches!(
+            DnsError::from("plain error"),
+            DnsError::Generic(message) if message == "plain error"
+        ));
+        assert!(matches!(
+            DnsError::from(String::from("owned error")),
+            DnsError::Generic(message) if message == "owned error"
+        ));
+    }
+
+    #[test]
+    fn test_from_config_error_maps_to_config_variant() {
+        let error = DnsError::from(ConfigError::EmptyPluginTag);
+
+        assert!(
+            matches!(error, DnsError::Config(message) if message == "Plugin tag cannot be empty")
+        );
+    }
+}

@@ -1,0 +1,238 @@
+// SPDX-FileCopyrightText: 2025 Sven Shi
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! Connection pooling infrastructure for DNS upstreams
+//!
+//! Provides high-performance connection management with different pooling
+//! strategies:
+//!
+//! # Pool Types
+//!
+//! ## Pipeline Pool (`pipeline.rs`)
+//! - Supports multiple concurrent requests per connection
+//! - Ideal for TCP/TLS/QUIC/DoH where connections can handle parallel queries
+//! - Automatic scaling based on load (min_size to max_size)
+//! - Configurable max load per connection to prevent overloading
+//!
+//! ## Reuse Pool (`reuse.rs`)
+//! - One request per connection at a time
+//! - Connections are borrowed and returned to pool
+//! - Ideal for UDP or when pipelining is disabled
+//! - Automatic idle connection cleanup
+//!
+//! # Connection Types
+//! - `udp_conn`: UDP connections with automatic TCP fallback
+//! - `tcp_conn`: Plain TCP and DoT (DNS over TLS) connections
+//! - `quic_conn`: DoQ (DNS over QUIC) connections
+//! - `h2_conn`: DoH over HTTP/2 connections
+//! - `h3_conn`: DoH over HTTP/3 connections
+//!
+//! # Performance Features
+//! - Lock-free connection selection with atomic operations
+//! - Background maintenance tasks for idle connection cleanup
+//! - Request/response matching via lock-free request map
+//! - Zero-copy message passing where possible
+//! - Connection reuse to amortize handshake costs
+
+use std::fmt::Debug;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use tokio::task::yield_now;
+
+use crate::infra::error::Result;
+pub use crate::infra::network::deadline::{DeadlineOutcome, QueryDeadline};
+use crate::infra::network::upstream::config::ConnectionInfo;
+use crate::infra::task as task_center;
+use crate::proto::Message;
+
+pub(crate) mod pipeline;
+pub(crate) mod reuse;
+
+/// Pool-owned policy for handling a single query timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryTimeoutPolicy {
+    /// The connection can be reused after an ordinary query timeout.
+    Reuse,
+    /// Stop new acquisitions and close after existing in-flight work drains.
+    Retire,
+    /// Close immediately and release pool capacity.
+    Close,
+}
+
+/// Minimum and maximum connections configured for a pool.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PoolSize {
+    pub(crate) min: usize,
+    pub(crate) max: usize,
+}
+
+impl PoolSize {
+    pub(crate) const fn new(min: usize, max: usize) -> Self {
+        Self { min, max }
+    }
+}
+
+/// Connection trait - represents a single persistent connection to an upstream
+/// DNS server
+///
+/// All connection types (UDP, TCP, QUIC, H2, H3) implement this trait.
+/// Connections manage their own request/response correlation and lifecycle.
+#[async_trait]
+pub trait Connection: Send + Sized + Debug + Sync + 'static {
+    /// Mark this connection as closed and notify listeners
+    ///
+    /// Should be idempotent - safe to call multiple times
+    fn close(&self);
+
+    /// Send a DNS query and asynchronously wait for the response
+    ///
+    /// This is a hot path - implementations should minimize overhead
+    async fn query(&self, request: Message, deadline: QueryDeadline) -> Result<Message>;
+
+    /// Get the number of queries currently in flight on this connection
+    ///
+    /// Used by pipeline pools to balance load across connections
+    fn using_count(&self) -> u16;
+
+    /// Check if the connection is available for use
+    ///
+    /// Returns false if the connection is closed or experiencing errors
+    fn available(&self) -> bool;
+
+    /// Get the timestamp of the last successful activity (in milliseconds)
+    ///
+    /// Used for idle connection detection and cleanup
+    fn last_used(&self) -> u64;
+}
+
+/// Connection builder trait - creates new connections on demand
+///
+/// Each connection type has a corresponding builder that knows how to
+/// establish connections with the appropriate protocol-specific handshakes.
+#[async_trait]
+pub trait ConnectionBuilder<C: Connection>: Send + Sync + Debug + 'static {
+    /// Create a new connection with the given ID
+    ///
+    /// # Arguments
+    /// * `conn_id` - Unique identifier for this connection (used for
+    ///   debugging/logging)
+    ///
+    /// # Returns
+    /// Arc-wrapped connection on success, or error if connection establishment
+    /// fails
+    async fn create_connection(
+        &self,
+        conn_id: u16,
+        deadline: QueryDeadline,
+        connection_info: Arc<ConnectionInfo>,
+    ) -> Result<Arc<C>>;
+}
+
+/// Connection pool trait - manages a pool of connections for load balancing
+///
+/// Different pool implementations provide different strategies:
+/// - Pipeline pools allow multiple concurrent requests per connection
+/// - Reuse pools borrow/return connections for single requests
+#[async_trait]
+pub trait ConnectionPool<C: Connection>: Send + Sync + Debug + 'static {
+    /// Execute a DNS query through the pool
+    ///
+    /// The pool automatically selects or creates an appropriate connection.
+    /// This is the main hot path for DNS queries.
+    async fn query(&self, request: Message, deadline: QueryDeadline) -> Result<Message>;
+
+    /// Perform maintenance on the pool
+    ///
+    /// Called periodically by background task to:
+    /// - Remove idle connections
+    /// - Drop failed connections
+    /// - Ensure minimum pool size
+    async fn maintain(&self);
+
+    #[cfg(test)]
+    fn configured_min_size(&self) -> usize;
+}
+
+/// Pools that own a periodic maintenance task managed by the global task
+/// center.
+pub trait ManagedMaintenanceTask {
+    fn maintenance_task_handle(&self) -> &Mutex<Option<task_center::ManagedTaskHandle>>;
+    fn maintenance_task_name(&self) -> String;
+}
+
+/// Maintenance interval for pool cleanup
+const MAINTENANCE_DURATION: Duration = Duration::from_secs(10);
+
+/// Start background maintenance task for a connection pool
+///
+/// Periodically calls `maintain()` to clean up idle/dead connections.
+/// The task runs for the lifetime of the pool.
+#[inline]
+fn start_maintenance<C, P>(pool: &Arc<P>)
+where
+    C: Connection,
+    P: ConnectionPool<C> + ManagedMaintenanceTask + 'static,
+{
+    let weak_pool: Weak<P> = Arc::downgrade(pool);
+    let task_name = pool.maintenance_task_name();
+    let task_handle = task_center::spawn_fixed(
+        task_name,
+        MAINTENANCE_DURATION,
+        task_center::TaskOptions::default(),
+        move |_| {
+            let weak_pool = weak_pool.clone();
+            async move {
+                let Some(pool) = weak_pool.upgrade() else {
+                    return;
+                };
+
+                // Perform maintenance (awaiting ensures fairness and proper
+                // error handling)
+                pool.maintain().await;
+                // Yield to allow other tasks to run
+                yield_now().await;
+            }
+        },
+    )
+    .expect("global task center must accept pool maintenance task");
+    *pool
+        .maintenance_task_handle()
+        .lock()
+        .expect("maintenance_task_handle poisoned") = Some(task_handle);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::infra::clock::AppClock;
+
+    #[test]
+    fn query_deadline_remaining_decreases_and_expires() {
+        AppClock::start();
+        let deadline = QueryDeadline::new(Duration::from_millis(20));
+
+        let first = deadline
+            .remaining()
+            .expect("deadline should have initial remaining time");
+        std::thread::sleep(Duration::from_millis(30));
+
+        assert!(first <= Duration::from_millis(20));
+        assert!(deadline.remaining().is_none());
+    }
+
+    #[tokio::test]
+    async fn query_deadline_run_returns_expired() {
+        AppClock::start();
+        let deadline = QueryDeadline::new(Duration::from_millis(10));
+
+        let outcome = deadline
+            .run(tokio::time::sleep(Duration::from_millis(60)))
+            .await;
+
+        assert!(matches!(outcome, DeadlineOutcome::Expired));
+    }
+}

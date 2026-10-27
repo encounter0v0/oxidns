@@ -1,0 +1,30 @@
+---
+title: Management API
+sidebar_position: 4
+---
+
+The OxiDNS management API is a separate control plane for health checks, configuration validation and persistence, process control, logs, upgrades, plugin extension APIs, and Prometheus metrics. This page is the interface map; detailed request formats, response fields, and examples live in topic pages.
+
+## Recommended workflow
+
+1. Configure listening, TLS, Basic Auth, CORS, and the WebUI through [Conventions and Security](api/conventions.mdx).
+2. Check the listener with `GET /api/healthz`, then use `GET /api/readyz` for DNS service readiness.
+3. Validate configuration before saving it; apply it through reload and poll the reload status.
+4. Expose control, logs, upgrades, and plugin data only to trusted networks.
+5. Keep `/api/metrics` within the same access-control boundary as the management plane.
+
+## Interface map
+
+| Topic | Main routes |
+| --- | --- |
+| [Conventions and Security](api/conventions.mdx) | Listening, HTTPS/mTLS, Basic Auth, WebUI, CORS, route layout, configuration templates |
+| [Health, Control, Logs, and Upgrades](api/control.mdx) | `/api/health*`, `/api/build`, `/api/control`, reload, logs/SSE, and upgrade |
+| [Configuration API](api/configuration.mdx) | Read, write, check, and validate configuration |
+| [Plugin Extension APIs](api/plugins.mdx) | Cache, cron, download, matcher, provider, reverse lookup, and query recorder |
+| [Prometheus Metrics](api/metrics.mdx) | `/api/metrics` and the metric catalog |
+
+## Compatibility
+
+The management API reflects capabilities compiled into the current binary. Automation should inspect `/api/build` for bundle and plugin support and tolerate absent routes for optional plugins. Repeat readiness, configuration validation, and critical API smoke tests after an upgrade.
+
+<span id="how-to-enable-it"></span><span id="authentication-and-transport"></span><span id="built-in-health-endpoints"></span><span id="config-check-endpoints"></span><span id="plugin-extension-apis"></span><span id="prometheus-metrics"></span>

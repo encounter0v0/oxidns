@@ -1,0 +1,335 @@
+// SPDX-FileCopyrightText: 2025 Sven Shi
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! `metrics_collector` executor plugin.
+//!
+//! Collects lightweight in-process counters and latency statistics for a
+//! sequence section.
+//!
+//! Like server-side request handling in `plugin/server/mod.rs`, this plugin
+//! only observes and annotates request lifecycle without changing resolver
+//! routing decisions:
+//! - `execute`: increments total/inflight counters and stores start timestamp.
+//! - continuation post-stage: decrements inflight, records success/error and
+//!   latency.
+//! - snapshot logging: emits aggregated metrics every 1024 requests.
+//!
+//! Design goal is low overhead on hot paths: atomics with relaxed ordering and
+//! no allocation in steady-state execution.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_yaml_ng::Value;
+use tracing::debug;
+
+use crate::config::types::PluginConfig;
+use crate::core::context::DnsContext;
+use crate::infra::clock::AppClock;
+use crate::infra::error::Result;
+use crate::infra::observability::metrics::{
+    MetricLabel, MetricSample, MetricSink, MetricSource, register_metric_source,
+    unregister_metric_source,
+};
+use crate::plugin::executor::{ExecStep, Executor, ExecutorNext};
+use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
+use crate::{continue_next, plugin_factory};
+
+const DEFAULT_NAME: &str = "default";
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct MetricsCollectorConfig {
+    /// Optional metrics namespace/name label.
+    name: Option<String>,
+}
+
+#[derive(Debug)]
+struct MetricsCollector {
+    tag: String,
+    stats: Arc<MetricsCollectorStats>,
+}
+
+#[derive(Debug)]
+struct MetricsCollectorStats {
+    tag: String,
+    name: String,
+    query_total: AtomicU64,
+    err_total: AtomicU64,
+    inflight: AtomicU64,
+    latency_count: AtomicU64,
+    latency_sum_ms: AtomicU64,
+}
+
+#[async_trait]
+impl Plugin for MetricsCollector {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    async fn init(&mut self, _context: &crate::plugin::PluginInitContext<'_>) -> Result<()> {
+        register_metric_source(self.stats.clone())
+    }
+
+    async fn destroy(&self) -> Result<()> {
+        unregister_metric_source(&self.stats.tag);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Executor for MetricsCollector {
+    fn with_next(&self) -> bool {
+        true
+    }
+
+    #[hotpath::measure]
+    async fn execute(&self, context: &mut DnsContext) -> Result<ExecStep> {
+        self.execute_with_next(context, None).await
+    }
+
+    #[hotpath::measure]
+    async fn execute_with_next(
+        &self,
+        context: &mut DnsContext,
+        next: Option<ExecutorNext>,
+    ) -> Result<ExecStep> {
+        self.stats.query_total.fetch_add(1, Ordering::Relaxed);
+        self.stats.inflight.fetch_add(1, Ordering::Relaxed);
+        let start_ms = AppClock::elapsed_millis();
+        let result = continue_next!(next, context);
+        self.finalize_metrics(context, start_ms);
+        result
+    }
+}
+
+impl MetricsCollector {
+    fn finalize_metrics(&self, context: &DnsContext, start_ms: u64) {
+        self.stats.inflight.fetch_sub(1, Ordering::Relaxed);
+
+        if context.response().is_none() {
+            self.stats.err_total.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        let elapsed = AppClock::elapsed_millis().saturating_sub(start_ms);
+        self.stats.latency_count.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .latency_sum_ms
+            .fetch_add(elapsed, Ordering::Relaxed);
+
+        let total = self.stats.query_total.load(Ordering::Relaxed);
+        if total.is_multiple_of(1024) {
+            let count = self.stats.latency_count.load(Ordering::Relaxed);
+            let sum = self.stats.latency_sum_ms.load(Ordering::Relaxed);
+            let avg = sum.checked_div(count);
+            debug!(
+                plugin = %self.stats.tag,
+                name = %self.stats.name,
+                query_total = total,
+                err_total = self.stats.err_total.load(Ordering::Relaxed),
+                inflight = self.stats.inflight.load(Ordering::Relaxed),
+                avg_latency_ms = avg,
+                "metrics_collector snapshot"
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[plugin_factory("metrics_collector")]
+pub struct MetricsCollectorFactory;
+
+impl PluginFactory for MetricsCollectorFactory {
+    fn create(
+        &self,
+        plugin_config: &PluginConfig,
+        _init_context: &crate::plugin::PluginInitContext<'_>,
+    ) -> Result<UninitializedPlugin> {
+        let name =
+            parse_name(plugin_config.args.clone()).unwrap_or_else(|| DEFAULT_NAME.to_string());
+
+        Ok(UninitializedPlugin::Executor(Box::new(MetricsCollector {
+            tag: plugin_config.tag.clone(),
+            stats: Arc::new(MetricsCollectorStats::new(plugin_config.tag.clone(), name)),
+        })))
+    }
+
+    fn quick_setup(&self, tag: &str, param: Option<String>) -> Result<UninitializedPlugin> {
+        let name = param
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_NAME.to_string());
+
+        Ok(UninitializedPlugin::Executor(Box::new(MetricsCollector {
+            tag: tag.to_string(),
+            stats: Arc::new(MetricsCollectorStats::new(tag.to_string(), name)),
+        })))
+    }
+}
+
+impl MetricsCollectorStats {
+    fn new(tag: String, name: String) -> Self {
+        Self {
+            tag,
+            name,
+            query_total: AtomicU64::new(0),
+            err_total: AtomicU64::new(0),
+            inflight: AtomicU64::new(0),
+            latency_count: AtomicU64::new(0),
+            latency_sum_ms: AtomicU64::new(0),
+        }
+    }
+}
+
+impl MetricSource for MetricsCollectorStats {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn plugin_type(&self) -> &'static str {
+        "metrics_collector"
+    }
+
+    fn collect(&self, sink: &mut dyn MetricSink) {
+        let labels = [
+            MetricLabel::new("plugin_tag", self.tag.as_str()),
+            MetricLabel::new("name", self.name.as_str()),
+        ];
+        sink.emit(MetricSample::counter(
+            "query_total",
+            "Total DNS queries observed by metrics_collector.",
+            &labels,
+            self.query_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "query_error_total",
+            "Total DNS queries without a response.",
+            &labels,
+            self.err_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::gauge(
+            "query_inflight",
+            "Current number of inflight DNS queries.",
+            &labels,
+            self.inflight.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "query_latency_count",
+            "Total completed queries included in latency statistics.",
+            &labels,
+            self.latency_count.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "query_latency_sum_ms",
+            "Total latency in milliseconds for completed queries.",
+            &labels,
+            self.latency_sum_ms.load(Ordering::Relaxed),
+        ));
+    }
+}
+
+fn parse_name(args: Option<Value>) -> Option<String> {
+    let args = args?;
+
+    if let Some(s) = args.as_str() {
+        let s = s.trim();
+        return if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        };
+    }
+
+    serde_yaml_ng::from_value::<MetricsCollectorConfig>(args)
+        .ok()
+        .and_then(|cfg| cfg.name)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::plugin::test_utils::test_context;
+
+    #[test]
+    fn test_parse_name_trims_and_filters_empty() {
+        assert_eq!(parse_name(None), None);
+        assert_eq!(
+            parse_name(Some(Value::String(" a ".into()))),
+            Some("a".into())
+        );
+        assert_eq!(parse_name(Some(Value::String("   ".into()))), None);
+    }
+
+    fn make_collector() -> MetricsCollector {
+        MetricsCollector {
+            tag: "metrics".to_string(),
+            stats: Arc::new(MetricsCollectorStats::new(
+                "metrics".to_string(),
+                "default".to_string(),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metrics_collector_records_error_path() {
+        AppClock::start();
+        let plugin = make_collector();
+        let mut ctx = test_context();
+
+        plugin
+            .execute_with_next(&mut ctx, None)
+            .await
+            .expect("continuation execute should work");
+
+        assert_eq!(plugin.stats.query_total.load(Ordering::Relaxed), 1);
+        assert_eq!(plugin.stats.inflight.load(Ordering::Relaxed), 0);
+        assert_eq!(plugin.stats.err_total.load(Ordering::Relaxed), 1);
+        assert_eq!(plugin.stats.latency_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_collector_records_success_latency() {
+        AppClock::start();
+        let plugin = make_collector();
+        let mut ctx = test_context();
+        ctx.set_response(crate::proto::Message::new());
+
+        plugin
+            .execute_with_next(&mut ctx, None)
+            .await
+            .expect("continuation execute should work");
+
+        assert_eq!(plugin.stats.err_total.load(Ordering::Relaxed), 0);
+        assert_eq!(plugin.stats.latency_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_render_prometheus_metrics_includes_labels_and_values() {
+        let _guard = crate::infra::observability::metrics::metrics_test_guard();
+        crate::infra::observability::metrics::reset_metrics_for_tests();
+        let stats = Arc::new(MetricsCollectorStats::new(
+            "metrics_main".to_string(),
+            "default".to_string(),
+        ));
+        stats.query_total.store(3, Ordering::Relaxed);
+        stats.err_total.store(1, Ordering::Relaxed);
+        stats.inflight.store(2, Ordering::Relaxed);
+        stats.latency_count.store(2, Ordering::Relaxed);
+        stats.latency_sum_ms.store(15, Ordering::Relaxed);
+        register_metric_source(stats).expect("metric source should register");
+
+        let output = crate::infra::observability::metrics::render_prometheus_metrics();
+        assert!(output.contains("query_total{plugin_tag=\"metrics_main\",name=\"default\"} 3"));
+        assert!(
+            output.contains("query_error_total{plugin_tag=\"metrics_main\",name=\"default\"} 1")
+        );
+        assert!(output.contains("query_inflight{plugin_tag=\"metrics_main\",name=\"default\"} 2"));
+        crate::infra::observability::metrics::reset_metrics_for_tests();
+    }
+}

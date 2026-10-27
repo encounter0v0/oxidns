@@ -1,0 +1,5959 @@
+// SPDX-FileCopyrightText: 2025 Sven Shi
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+use std::fs;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::process::Command;
+use std::sync::Arc;
+#[cfg(feature = "plugin-script")]
+use std::sync::Arc as StdArc;
+
+// The HTTP / SOCKS5 mock-server helpers are only compiled when a feature that
+// exercises the shared HTTP client (download / http_request) is enabled.
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+use bytes::Bytes;
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+use http_body_util::{BodyExt, Full};
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+use hyper::header::LOCATION;
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+use hyper::server::conn::http1;
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+use hyper::service::service_fn;
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+use hyper::{Request, Response, StatusCode};
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+use hyper_util::rt::TokioIo;
+use oxidns::config::types::Config;
+use oxidns::core::context::DnsContext;
+#[cfg(feature = "plugin-script")]
+use oxidns::core::context::RequestMeta;
+use oxidns::infra::clock::AppClock;
+use oxidns::infra::error::{DnsError, Result};
+use oxidns::infra::network::transport::udp::UdpTransport;
+use oxidns::plugin;
+use oxidns::plugin::executor::ExecStep;
+use oxidns::plugin::{PluginRegistry, PluginType};
+#[cfg(any(feature = "plugin-dynamic-domain", feature = "plugin-response"))]
+use oxidns::proto::RData;
+#[cfg(feature = "plugin-dynamic-domain")]
+use oxidns::proto::Record;
+#[cfg(feature = "plugin-dynamic-domain")]
+use oxidns::proto::rdata::A;
+use oxidns::proto::{DNSClass, Message, Name, Question, Rcode, RecordType};
+use tempfile::TempDir;
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UdpSocket;
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+use tokio::sync::mpsc;
+#[cfg(target_os = "linux")]
+use tokio::time::sleep;
+use tokio::time::{Duration, timeout};
+
+fn parse_config(yaml: &str) -> Result<Config> {
+    AppClock::start();
+    #[cfg(debug_assertions)]
+    plugin::enable_runtime_test_serialization();
+    let config: Config = serde_yaml_ng::from_str(yaml)?;
+    config.validate()?;
+    Ok(config)
+}
+
+fn make_context(registry: Arc<PluginRegistry>, qname: &str) -> DnsContext {
+    make_context_with_qtype(registry, qname, RecordType::A)
+}
+
+fn make_context_with_qtype(
+    _registry: Arc<PluginRegistry>,
+    qname: &str,
+    qtype: RecordType,
+) -> DnsContext {
+    let mut request = Message::new();
+    request.add_question(Question::new(
+        Name::from_ascii(qname).expect("query name should be valid"),
+        qtype,
+        DNSClass::IN,
+    ));
+
+    DnsContext::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 5300)), request)
+}
+
+#[cfg(feature = "plugin-client-ip-from-ecs")]
+#[tokio::test]
+async fn test_client_ip_from_ecs_updates_client_ip_for_following_matcher() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: ecs_client
+    type: client_ip_from_ecs
+  - tag: lan_client
+    type: client_ip
+    args:
+      - "192.0.2.0/24"
+  - tag: main
+    type: sequence
+    args:
+      - exec: $ecs_client
+      - matches: $lan_client
+        exec: mark 7
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("main")
+        .expect("main sequence should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+    context
+        .request_mut()
+        .ensure_edns_mut()
+        .insert(oxidns::proto::EdnsOption::Subnet(
+            oxidns::proto::ClientSubnet::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 42)), 32, 0),
+        ));
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert_eq!(step, ExecStep::Next);
+    assert_eq!(
+        context.peer_addr(),
+        SocketAddr::from((Ipv4Addr::new(192, 0, 2, 42), 5300))
+    );
+    assert!(context.marks().contains(&7));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+fn test_rule_path(relative_name: &str) -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("testdata")
+        .join("rules")
+        .join(relative_name)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn yaml_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(feature = "plugin-script")]
+#[cfg(unix)]
+fn platform_script_command(script_path: &std::path::Path) -> (String, Vec<String>) {
+    ("sh".to_string(), vec![yaml_path(script_path)])
+}
+
+#[cfg(feature = "plugin-script")]
+#[cfg(windows)]
+fn platform_script_command(script_path: &std::path::Path) -> (String, Vec<String>) {
+    (
+        "cmd.exe".to_string(),
+        vec!["/C".to_string(), yaml_path(script_path)],
+    )
+}
+
+#[cfg(feature = "plugin-script")]
+#[cfg(unix)]
+fn write_capture_script(
+    script_path: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<()> {
+    std::fs::write(
+        script_path,
+        format!(
+            "#!/bin/sh\nprintf 'ARGS=%s\\n' \"$*\" > \"{}\"\nprintf 'QNAME=%s\\n' \"$FDNS_QNAME\" >> \"{}\"\nprintf 'CLIENT=%s\\n' \"$FDNS_CLIENT_IP\" >> \"{}\"\nprintf 'SERVER=%s\\n' \"$FDNS_SERVER_NAME\" >> \"{}\"\nprintf 'URL=%s\\n' \"$FDNS_URL_PATH\" >> \"{}\"\nprintf 'MARKS=%s\\n' \"$FDNS_MARKS\" >> \"{}\"\nprintf 'HAS_RESP=%s\\n' \"$FDNS_HAS_RESP\" >> \"{}\"\nprintf 'RCODE=%s\\n' \"$FDNS_RCODE\" >> \"{}\"\nprintf 'RESP_IP=%s\\n' \"$FDNS_RESP_IP\" >> \"{}\"\nprintf 'CRON_JOB=%s\\n' \"$FDNS_CRON_JOB\" >> \"{}\"\n",
+            yaml_path(output_path),
+            yaml_path(output_path),
+            yaml_path(output_path),
+            yaml_path(output_path),
+            yaml_path(output_path),
+            yaml_path(output_path),
+            yaml_path(output_path),
+            yaml_path(output_path),
+            yaml_path(output_path),
+            yaml_path(output_path),
+        ),
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-script")]
+#[cfg(windows)]
+fn write_capture_script(
+    script_path: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<()> {
+    std::fs::write(
+        script_path,
+        format!(
+            "@echo off\r\n> \"{0}\" echo ARGS=%*\r\n>> \"{0}\" echo QNAME=%FDNS_QNAME%\r\n>> \"{0}\" echo CLIENT=%FDNS_CLIENT_IP%\r\n>> \"{0}\" echo SERVER=%FDNS_SERVER_NAME%\r\n>> \"{0}\" echo URL=%FDNS_URL_PATH%\r\n>> \"{0}\" echo MARKS=%FDNS_MARKS%\r\n>> \"{0}\" echo HAS_RESP=%FDNS_HAS_RESP%\r\n>> \"{0}\" echo RCODE=%FDNS_RCODE%\r\n>> \"{0}\" echo RESP_IP=%FDNS_RESP_IP%\r\n>> \"{0}\" echo CRON_JOB=%FDNS_CRON_JOB%\r\n",
+            yaml_path(output_path),
+        ),
+    )?;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-script")]
+#[cfg(unix)]
+fn write_timeout_script(script_path: &std::path::Path) -> Result<()> {
+    std::fs::write(script_path, "#!/bin/sh\nsleep 3\n")?;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-script")]
+#[cfg(windows)]
+fn write_timeout_script(script_path: &std::path::Path) -> Result<()> {
+    std::fs::write(script_path, "@echo off\r\nping 127.0.0.1 -n 4 >nul\r\n")?;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-script")]
+#[cfg(unix)]
+fn write_failure_script(script_path: &std::path::Path, code: i32) -> Result<()> {
+    std::fs::write(script_path, format!("#!/bin/sh\nexit {}\n", code))?;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-script")]
+#[cfg(windows)]
+fn write_failure_script(script_path: &std::path::Path, code: i32) -> Result<()> {
+    std::fs::write(script_path, format!("@echo off\r\nexit /b {}\r\n", code))?;
+    Ok(())
+}
+
+fn reserve_local_udp_addr() -> Result<SocketAddr> {
+    let socket = StdUdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let addr = socket.local_addr()?;
+    drop(socket);
+    Ok(addr)
+}
+
+async fn exchange_udp_query(server_addr: SocketAddr, qname: &str) -> Result<Message> {
+    exchange_udp_query_with_qtype(server_addr, qname, RecordType::A).await
+}
+
+async fn exchange_udp_query_with_qtype(
+    server_addr: SocketAddr,
+    qname: &str,
+    qtype: RecordType,
+) -> Result<Message> {
+    let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+    socket.connect(server_addr).await?;
+    let transport = UdpTransport::new(socket);
+
+    let mut request = Message::new();
+    request.set_id(0x1234);
+    request.add_question(Question::new(
+        Name::from_ascii(qname).expect("query name should be valid"),
+        qtype,
+        DNSClass::IN,
+    ));
+
+    transport
+        .write_message_with_id(&request, request.id())
+        .await?;
+
+    let mut buf = [0u8; 4096];
+    timeout(Duration::from_secs(1), transport.read_message(&mut buf))
+        .await
+        .map_err(|_| DnsError::runtime("timed out waiting for UDP server response"))?
+}
+
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+async fn start_test_http_server(
+    routes: Vec<(&'static str, StatusCode, &'static str)>,
+) -> Result<SocketAddr> {
+    let routes = routes
+        .into_iter()
+        .map(|(path, status, body)| {
+            TestHttpRoute::new(path.to_string(), status, body.as_bytes().to_vec())
+        })
+        .collect();
+    start_test_http_server_routes(routes).await
+}
+
+#[cfg(feature = "plugin-ip-selector")]
+async fn start_tcp_probe_server() -> Result<SocketAddr> {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            drop(stream);
+        }
+    });
+    Ok(addr)
+}
+
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+#[derive(Clone)]
+struct TestHttpRoute {
+    path: String,
+    status: StatusCode,
+    body: Vec<u8>,
+    location: Option<String>,
+    response_delay: Option<Duration>,
+}
+
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+impl TestHttpRoute {
+    fn new(path: String, status: StatusCode, body: Vec<u8>) -> Self {
+        Self {
+            path,
+            status,
+            body,
+            location: None,
+            response_delay: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+struct CapturedHttpRequest {
+    method: String,
+    path: String,
+    query: Option<String>,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+impl CapturedHttpRequest {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn body_text(&self) -> String {
+        String::from_utf8_lossy(self.body.as_slice()).into_owned()
+    }
+}
+
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+async fn start_test_http_server_routes(routes: Vec<TestHttpRoute>) -> Result<SocketAddr> {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+    let addr = listener.local_addr()?;
+    let routes = Arc::new(routes);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let routes = routes.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+                    let routes = routes.clone();
+                    async move {
+                        let path = request.uri().path();
+                        let response = routes
+                            .iter()
+                            .find(|route| route.path == path)
+                            .map(|route| {
+                                let mut builder = Response::builder().status(route.status);
+                                if let Some(location) = route.location.as_deref() {
+                                    builder = builder.header(LOCATION, location);
+                                }
+                                let delay = route.response_delay;
+                                builder
+                                    .body(Full::new(Bytes::from(route.body.clone())))
+                                    .map(|response| (response, delay))
+                                    .expect("response should build")
+                            })
+                            .unwrap_or_else(|| {
+                                (
+                                    Response::builder()
+                                        .status(StatusCode::NOT_FOUND)
+                                        .body(Full::new(Bytes::from_static(b"not found")))
+                                        .expect("response should build"),
+                                    None,
+                                )
+                            });
+                        if let Some(delay) = response.1 {
+                            tokio::time::sleep(delay).await;
+                        }
+                        Ok::<_, std::convert::Infallible>(response.0)
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    Ok(addr)
+}
+
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+async fn start_recording_http_server_routes(
+    routes: Vec<TestHttpRoute>,
+) -> Result<(SocketAddr, mpsc::UnboundedReceiver<CapturedHttpRequest>)> {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+    let addr = listener.local_addr()?;
+    let routes = Arc::new(routes);
+    let (tx, rx) = mpsc::unbounded_channel::<CapturedHttpRequest>();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let routes = routes.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+                    let routes = routes.clone();
+                    let tx = tx.clone();
+                    async move {
+                        let (parts, body) = request.into_parts();
+                        let body = body
+                            .collect()
+                            .await
+                            .map(|collected| collected.to_bytes().to_vec())
+                            .unwrap_or_default();
+                        let captured = CapturedHttpRequest {
+                            method: parts.method.to_string(),
+                            path: parts.uri.path().to_string(),
+                            query: parts.uri.query().map(str::to_string),
+                            headers: parts
+                                .headers
+                                .iter()
+                                .map(|(key, value)| {
+                                    (
+                                        key.as_str().to_string(),
+                                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                                    )
+                                })
+                                .collect(),
+                            body,
+                        };
+                        let _ = tx.send(captured);
+
+                        let response = routes
+                            .iter()
+                            .find(|route| route.path == parts.uri.path())
+                            .map(|route| {
+                                let mut builder = Response::builder().status(route.status);
+                                if let Some(location) = route.location.as_deref() {
+                                    builder = builder.header(LOCATION, location);
+                                }
+                                let delay = route.response_delay;
+                                builder
+                                    .body(Full::new(Bytes::from(route.body.clone())))
+                                    .map(|response| (response, delay))
+                                    .expect("response should build")
+                            })
+                            .unwrap_or_else(|| {
+                                (
+                                    Response::builder()
+                                        .status(StatusCode::NOT_FOUND)
+                                        .body(Full::new(Bytes::from_static(b"not found")))
+                                        .expect("response should build"),
+                                    None,
+                                )
+                            });
+                        if let Some(delay) = response.1 {
+                            tokio::time::sleep(delay).await;
+                        }
+                        Ok::<_, std::convert::Infallible>(response.0)
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    Ok((addr, rx))
+}
+
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+async fn wait_for_captured_request(
+    rx: &mut mpsc::UnboundedReceiver<CapturedHttpRequest>,
+) -> Result<CapturedHttpRequest> {
+    timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .map_err(|_| DnsError::runtime("timed out waiting for recorded HTTP request"))?
+        .ok_or_else(|| DnsError::runtime("recording HTTP server channel closed unexpectedly"))
+}
+
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+async fn start_test_socks5_proxy() -> Result<SocketAddr> {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
+    let addr = listener.local_addr()?;
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let _ = handle_test_socks5_client(stream).await;
+            });
+        }
+    });
+
+    Ok(addr)
+}
+
+#[cfg(any(feature = "plugin-download", feature = "plugin-http-request"))]
+async fn handle_test_socks5_client(mut client: TcpStream) -> Result<()> {
+    let mut greeting = [0u8; 2];
+    client.read_exact(&mut greeting).await?;
+    if greeting[0] != 0x05 {
+        return Err(DnsError::runtime("invalid SOCKS5 version in greeting"));
+    }
+    let mut methods = vec![0u8; greeting[1] as usize];
+    client.read_exact(&mut methods).await?;
+    client.write_all(&[0x05, 0x00]).await?;
+
+    let mut header = [0u8; 4];
+    client.read_exact(&mut header).await?;
+    if header[0] != 0x05 || header[1] != 0x01 {
+        return Err(DnsError::runtime("unsupported SOCKS5 command"));
+    }
+
+    let target_host = match header[3] {
+        0x01 => {
+            let mut octets = [0u8; 4];
+            client.read_exact(&mut octets).await?;
+            Ipv4Addr::from(octets).to_string()
+        }
+        0x03 => {
+            let mut len = [0u8; 1];
+            client.read_exact(&mut len).await?;
+            let mut domain = vec![0u8; len[0] as usize];
+            client.read_exact(&mut domain).await?;
+            String::from_utf8(domain)
+                .map_err(|e| DnsError::runtime(format!("invalid SOCKS5 domain: {e}")))?
+        }
+        0x04 => {
+            let mut octets = [0u8; 16];
+            client.read_exact(&mut octets).await?;
+            Ipv6Addr::from(octets).to_string()
+        }
+        atyp => {
+            return Err(DnsError::runtime(format!(
+                "unsupported SOCKS5 address type: {atyp}"
+            )));
+        }
+    };
+
+    let mut port_bytes = [0u8; 2];
+    client.read_exact(&mut port_bytes).await?;
+    let target_port = u16::from_be_bytes(port_bytes);
+    let mut upstream = TcpStream::connect((target_host.as_str(), target_port)).await?;
+
+    client
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
+
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_system_plugin_tests_enabled() -> bool {
+    oxidns::infra::env::exists("TEST_LINUX_SYSTEM_PLUGINS")
+}
+
+#[cfg(target_os = "linux")]
+fn running_as_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|uid| uid.trim() == "0")
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn command_exists(program: &str, version_arg: &str) -> bool {
+    Command::new(program)
+        .arg(version_arg)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn should_run_linux_system_plugin_tests(program: &str, version_arg: &str) -> bool {
+    linux_system_plugin_tests_enabled() && running_as_root() && command_exists(program, version_arg)
+}
+
+#[cfg(target_os = "linux")]
+fn unique_system_object_name(prefix: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let suffix = format!("{:x}", nanos);
+    let max_prefix_len = 31usize.saturating_sub(1 + suffix.len());
+    let trimmed_prefix = prefix.chars().take(max_prefix_len).collect::<String>();
+    format!("{trimmed_prefix}_{suffix}")
+}
+
+#[cfg(target_os = "linux")]
+fn run_command(program: &str, args: &[&str]) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| DnsError::runtime(format!("failed to execute {program}: {e}")))?;
+    if !output.status.success() {
+        return Err(DnsError::runtime(format!(
+            "{program} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+struct CommandCleanup {
+    steps: Vec<(String, Vec<String>)>,
+}
+
+#[cfg(target_os = "linux")]
+impl CommandCleanup {
+    fn new(steps: Vec<(String, Vec<String>)>) -> Self {
+        Self { steps }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CommandCleanup {
+    fn drop(&mut self) {
+        for (program, args) in &self.steps {
+            let _ = Command::new(program).args(args).output();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_command_output_contains(
+    program: &str,
+    args: &[&str],
+    wanted: &str,
+) -> Result<()> {
+    for _ in 0..20 {
+        let output = run_command(program, args)?;
+        if output.contains(wanted) {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    Err(DnsError::runtime(format!(
+        "{program} {} did not contain '{wanted}' within timeout",
+        args.join(" ")
+    )))
+}
+
+#[test]
+fn test_load_example_config_and_validate() -> Result<()> {
+    let config = parse_config(include_str!("../config.yaml"))?;
+
+    assert!(
+        !config.plugins.is_empty(),
+        "example config should contain plugins"
+    );
+    assert!(
+        config.plugins.iter().any(|p| p.plugin_type == "udp_server"),
+        "example config should include udp_server"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plugin_system_init_and_destroy_with_minimal_config() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: debug
+    type: debug_print
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    assert_eq!(
+        registry.plugin_count(),
+        1,
+        "one plugin should be initialized"
+    );
+    assert!(registry.get_plugin("debug").is_some());
+
+    registry.destroy().await;
+    assert_eq!(registry.plugin_count(), 0, "plugins should be destroyed");
+    Ok(())
+}
+
+#[cfg(feature = "plugin-ros-route")]
+#[tokio::test]
+async fn test_ros_route_plugin_init_accepts_config_and_registers_executor() -> Result<()> {
+    let yaml = r#"
+plugins:
+  - tag: ros_route_policy
+    type: ros_route
+    args:
+      address: "127.0.0.1:9"
+      username: "api-user"
+      password: "secret"
+      connect_timeout: 1
+      send_timeout: 1
+      receive_timeout: 1
+      routing_table: "via_proxy"
+      gateway4: "192.0.2.1@main"
+      fixed_ttl: 0
+      cleanup_on_shutdown: false
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let route = registry
+        .get_plugin("ros_route_policy")
+        .expect("ros_route plugin should be registered");
+
+    assert_eq!(route.plugin_type, PluginType::Executor);
+    assert_eq!(route.plugin_name, "ros_route");
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-ros-address-list")]
+#[tokio::test]
+async fn test_ros_address_list_plugin_init_accepts_tls() -> Result<()> {
+    let yaml = r#"
+plugins:
+  - tag: ros_address_list_policy
+    type: ros_address_list
+    args:
+      address: "127.0.0.1:9"
+      username: "api-user"
+      password: "secret"
+      tls:
+        insecure: true
+      connect_timeout: 1
+      send_timeout: 1
+      receive_timeout: 1
+      address_list4: "oxidns_ipv4"
+      fixed_ttl: 0
+      cleanup_on_shutdown: false
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let address_list = registry
+        .get_plugin("ros_address_list_policy")
+        .expect("ros_address_list plugin should be registered");
+
+    assert_eq!(address_list.plugin_type, PluginType::Executor);
+    assert_eq!(address_list.plugin_name, "ros_address_list");
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plugin_system_init_resolves_sequence_dependency_and_quick_setup() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: allow_all
+    type: _true
+  - tag: seq
+    type: sequence
+    args:
+      - matches:
+          - $allow_all
+        exec: debug_print integration message
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    assert_eq!(registry.plugin_count(), 2);
+
+    let matcher = registry
+        .get_plugin("allow_all")
+        .expect("matcher plugin should be registered");
+    assert_eq!(matcher.plugin_type, PluginType::Matcher);
+
+    let sequence = registry
+        .get_plugin("seq")
+        .expect("sequence plugin should be registered");
+    assert_eq!(sequence.plugin_type, PluginType::Executor);
+    assert_eq!(sequence.plugin_name, "sequence");
+
+    registry.destroy().await;
+    assert_eq!(registry.plugin_count(), 0);
+    Ok(())
+}
+
+#[test]
+fn test_analyze_configuration_expands_sequence_quick_setup_dependency_edges() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: seq
+    type: sequence
+    args:
+      - matches:
+          - qname $zzz_set
+        exec: accept
+  - tag: zzz_set
+    type: domain_set
+    args:
+      exps:
+        - example.com
+"#;
+
+    let config = parse_config(yaml)?;
+    let report = plugin::analyze_configuration(&config)?;
+
+    assert_eq!(
+        report.init_order,
+        vec!["zzz_set".to_string(), "seq".to_string()]
+    );
+    assert!(report.edges.iter().any(|edge| {
+        edge.source_tag == "seq"
+            && edge.target_tag == "zzz_set"
+            && edge.field == "args[0].matches[0] -> quick_setup(qname).domain_set_tags[0]"
+    }));
+    Ok(())
+}
+
+#[test]
+fn test_analyze_configuration_tracks_negated_sequence_matcher_tag_dependency() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: seq
+    type: sequence
+    args:
+      - matches: "!$allow_all"
+        exec: accept
+  - tag: allow_all
+    type: _true
+"#;
+
+    let config = parse_config(yaml)?;
+    let report = plugin::analyze_configuration(&config)?;
+
+    assert_eq!(
+        report.init_order,
+        vec!["allow_all".to_string(), "seq".to_string()]
+    );
+    assert!(report.edges.iter().any(|edge| {
+        edge.source_tag == "seq"
+            && edge.target_tag == "allow_all"
+            && edge.field == "args[0].matches[0]"
+    }));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plugin_system_init_resolves_sequence_quick_setup_provider_dependency() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: seq
+    type: sequence
+    args:
+      - matches:
+          - qname $zzz_set
+        exec: accept
+      - exec: reject 2
+  - tag: zzz_set
+    type: domain_set
+    args:
+      exps:
+        - example.com
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    assert!(
+        registry.get_plugin("zzz_set").is_some(),
+        "provider used by quick setup should still be visible"
+    );
+
+    let sequence = registry
+        .get_plugin("seq")
+        .expect("sequence plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Stop));
+    assert!(context.response().is_none());
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_dual_selector_uses_dedicated_probe_executor_and_isolates_marks() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: probe_hosts
+    type: hosts
+    args:
+      entries:
+        - "full:example.com 192.0.2.10"
+  - tag: prefer_v4
+    type: prefer_ipv4
+    args:
+      probe_executor: probe_hosts
+      cache: false
+  - tag: main
+    type: sequence
+    args:
+      - exec: mark 1
+      - exec: $prefer_v4
+      - exec: mark 10
+      - exec: reject SERVFAIL
+"#;
+
+    let config = parse_config(yaml)?;
+    let report = plugin::analyze_configuration(&config)?;
+    assert!(report.edges.iter().any(|edge| {
+        edge.source_tag == "prefer_v4"
+            && edge.target_tag == "probe_hosts"
+            && edge.field == "args.probe_executor"
+    }));
+
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("main")
+        .expect("main sequence should exist")
+        .to_executor();
+    let mut context = make_context_with_qtype(registry.clone(), "example.com.", RecordType::AAAA);
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert_eq!(step, ExecStep::Stop);
+    assert_eq!(context.request().first_qtype(), Some(RecordType::AAAA));
+    let response = context
+        .response()
+        .expect("preferred probe should suppress AAAA");
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.answers().is_empty());
+    assert!(context.marks().contains(&1));
+    assert!(!context.marks().contains(&10));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_dual_selector_accepts_sequence_as_dedicated_probe_executor() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: probe_hosts
+    type: hosts
+    args:
+      entries:
+        - "full:example.com 192.0.2.10"
+  - tag: probe_sequence
+    type: sequence
+    args:
+      - exec: mark 20
+      - exec: $probe_hosts
+  - tag: prefer_v4
+    type: prefer_ipv4
+    args:
+      probe_executor: probe_sequence
+      cache: false
+  - tag: main
+    type: sequence
+    args:
+      - exec: mark 1
+      - exec: $prefer_v4
+      - exec: mark 10
+      - exec: reject SERVFAIL
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("main")
+        .expect("main sequence should exist")
+        .to_executor();
+    let mut context = make_context_with_qtype(registry.clone(), "example.com.", RecordType::AAAA);
+
+    sequence.execute(&mut context).await?;
+
+    assert_eq!(
+        context
+            .response()
+            .expect("preferred probe should suppress AAAA")
+            .rcode(),
+        Rcode::NoError
+    );
+    assert!(context.marks().contains(&1));
+    assert!(!context.marks().contains(&10));
+    assert!(!context.marks().contains(&20));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[test]
+fn test_dual_selector_probe_executor_dependency_validation() -> Result<()> {
+    let missing = parse_config(
+        r#"
+plugins:
+  - tag: prefer_v4
+    type: prefer_ipv4
+    args:
+      probe_executor: missing
+"#,
+    )?;
+    let err = plugin::analyze_configuration(&missing)
+        .expect_err("missing probe executor should fail dependency analysis");
+    assert!(err.to_string().contains("missing plugin 'missing'"));
+    assert!(err.to_string().contains("args.probe_executor"));
+
+    let wrong_kind = parse_config(
+        r#"
+plugins:
+  - tag: not_executor
+    type: _true
+  - tag: prefer_v4
+    type: prefer_ipv4
+    args:
+      probe_executor: not_executor
+"#,
+    )?;
+    let err = plugin::analyze_configuration(&wrong_kind)
+        .expect_err("non-executor probe target should fail dependency analysis");
+    assert!(err.to_string().contains("expects executor"));
+    assert!(err.to_string().contains("not_executor"));
+
+    let self_reference = parse_config(
+        r#"
+plugins:
+  - tag: prefer_v4
+    type: prefer_ipv4
+    args:
+      probe_executor: prefer_v4
+"#,
+    )?;
+    let err = plugin::analyze_configuration(&self_reference)
+        .expect_err("self-referenced probe executor should fail dependency analysis");
+    assert!(err.to_string().contains("references itself"));
+
+    let cycle = parse_config(
+        r#"
+plugins:
+  - tag: prefer_a
+    type: prefer_ipv4
+    args:
+      probe_executor: prefer_b
+  - tag: prefer_b
+    type: prefer_ipv6
+    args:
+      probe_executor: prefer_a
+"#,
+    )?;
+    let err = plugin::analyze_configuration(&cycle)
+        .expect_err("probe executor cycle should fail dependency analysis");
+    assert!(err.to_string().contains("Circular dependency detected"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sequence_supports_single_match_string_dependency_and_execution() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: allow_all
+    type: _true
+  - tag: seq
+    type: sequence
+    args:
+      - matches: $allow_all
+        exec: mark 100
+      - exec: reject 2
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let sequence = registry
+        .get_plugin("seq")
+        .expect("sequence plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Stop));
+    assert!(context.marks().contains(&100));
+    assert_eq!(
+        context
+            .response()
+            .expect("reject should set a response")
+            .rcode(),
+        Rcode::ServFail
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plugin_system_init_reports_missing_dependency_with_field_context() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: seq
+    type: sequence
+    args:
+      - matches:
+          - $missing_matcher
+        exec: debug_print integration message
+"#;
+
+    let config = parse_config(yaml)?;
+    let err = plugin::init(config)
+        .await
+        .expect_err("missing dependency should fail plugin init");
+    let msg = err.to_string();
+
+    assert!(msg.contains("plugin 'seq'"));
+    assert!(msg.contains("args[0].matches[0]"));
+    assert!(msg.contains("missing plugin 'missing_matcher'"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plugin_system_init_reports_single_match_dependency_with_field_context() -> Result<()>
+{
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: seq
+    type: sequence
+    args:
+      - matches: $missing_matcher
+        exec: debug_print integration message
+"#;
+
+    let config = parse_config(yaml)?;
+    let err = plugin::init(config)
+        .await
+        .expect_err("missing dependency should fail plugin init");
+    let msg = err.to_string();
+
+    assert!(msg.contains("plugin 'seq'"));
+    assert!(msg.contains("args[0].matches[0]"));
+    assert!(msg.contains("missing plugin 'missing_matcher'"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plugin_system_init_reports_missing_quick_setup_dependency_with_field_context()
+-> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: seq
+    type: sequence
+    args:
+      - matches:
+          - qname $missing_set
+        exec: accept
+"#;
+
+    let config = parse_config(yaml)?;
+    let err = plugin::init(config)
+        .await
+        .expect_err("missing quick setup dependency should fail plugin init");
+    let msg = err.to_string();
+
+    assert!(msg.contains("plugin 'seq'"));
+    assert!(msg.contains("args[0].matches[0] -> quick_setup(qname).domain_set_tags[0]"));
+    assert!(msg.contains("missing plugin 'missing_set'"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sequence_executor_runs_quick_setup_matcher_and_builtin_ops() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: seq
+    type: sequence
+    args:
+      - matches:
+          - _true
+        exec: mark 100 200
+      - exec: reject 2
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let sequence = registry
+        .get_plugin("seq")
+        .expect("sequence plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Stop));
+    assert!(context.marks().contains(&100));
+    assert!(context.marks().contains(&200));
+    assert_eq!(
+        context
+            .response()
+            .expect("reject should set a response")
+            .rcode(),
+        Rcode::ServFail
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sequence_set_mark_replaces_multiple_marks_across_jump() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: child
+    type: sequence
+    args:
+      - exec: set_mark 2,3
+      - exec: return
+  - tag: parent
+    type: sequence
+    args:
+      - exec: mark 1 4
+      - exec: jump child
+      - exec: mark 5
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("parent")
+        .expect("parent sequence should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(context.marks().len(), 3);
+    assert!(context.marks().contains(&2));
+    assert!(context.marks().contains(&3));
+    assert!(context.marks().contains(&5));
+    assert!(!context.marks().contains(&1));
+    assert!(!context.marks().contains(&4));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sequence_set_mark_rejects_invalid_values_during_init() -> Result<()> {
+    for exec in [
+        "set_mark",
+        "set_mark -1",
+        "set_mark abc",
+        "set_mark 4294967296",
+    ] {
+        let yaml = format!(
+            r#"
+log:
+  level: info
+plugins:
+  - tag: seq
+    type: sequence
+    args:
+      - exec: "{exec}"
+"#
+        );
+        let config = parse_config(&yaml)?;
+        let err = plugin::init(config)
+            .await
+            .expect_err("invalid set_mark value should fail sequence initialization");
+        assert!(err.to_string().contains("set_mark"));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sequence_quick_setup_matchers_accept_enum_text() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: seq
+    type: sequence
+    args:
+      - matches:
+          - qtype A
+          - qclass IN
+        exec: mark 10
+      - matches: rcode SERVFAIL
+        exec: mark 20
+      - exec: reject 2
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let sequence = registry
+        .get_plugin("seq")
+        .expect("sequence plugin should exist")
+        .to_executor();
+    let mut context = make_context_with_qtype(registry.clone(), "example.com.", RecordType::A);
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Stop));
+    assert!(context.marks().contains(&10));
+    assert!(!context.marks().contains(&20));
+    assert_eq!(
+        context
+            .response()
+            .expect("reject should set a response")
+            .rcode(),
+        Rcode::ServFail
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_time_matcher_config_and_quick_setup_initialize() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: office_hours
+    type: time
+    args:
+      timezone: Asia/Shanghai
+      periods:
+        - start: "09:00"
+          end: "18:00"
+          weekdays: [1, 2, 3, 4, 5]
+        - monthdays: [1, 15]
+  - tag: seq
+    type: sequence
+    args:
+      - matches: time 22:00-02:00
+        exec: accept
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let matcher = registry
+        .get_plugin("office_hours")
+        .expect("time matcher should be registered");
+    assert_eq!(matcher.plugin_type, PluginType::Matcher);
+    assert_eq!(matcher.plugin_name, "time");
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_time_matcher_rejects_invalid_period_config() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: invalid_time
+    type: time
+    args:
+      periods:
+        - start: "09:00"
+          end: "09:00"
+"#;
+
+    let config = parse_config(yaml)?;
+    let err = plugin::init(config)
+        .await
+        .expect_err("same time boundaries must be rejected");
+    assert!(
+        err.to_string()
+            .contains("periods[0].start and periods[0].end must differ")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sequence_accept_in_jump_stops_current_and_parent_sequences() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: child
+    type: sequence
+    args:
+      - exec: mark 2
+      - exec: accept
+      - exec: mark 3
+  - tag: parent
+    type: sequence
+    args:
+      - exec: mark 1
+      - exec: jump child
+      - exec: mark 4
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("parent")
+        .expect("parent sequence should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Stop));
+    assert!(context.marks().contains(&1));
+    assert!(context.marks().contains(&2));
+    assert!(!context.marks().contains(&3));
+    assert!(!context.marks().contains(&4));
+    assert!(context.response().is_none());
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sequence_reject_defaults_to_refused_and_stops_parent_sequences() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: child
+    type: sequence
+    args:
+      - exec: mark 2
+      - exec: reject
+      - exec: mark 3
+  - tag: parent
+    type: sequence
+    args:
+      - exec: mark 1
+      - exec: jump child
+      - exec: mark 4
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("parent")
+        .expect("parent sequence should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Stop));
+    assert!(context.marks().contains(&1));
+    assert!(context.marks().contains(&2));
+    assert!(!context.marks().contains(&3));
+    assert!(!context.marks().contains(&4));
+    assert_eq!(
+        context
+            .response()
+            .expect("reject should set a response")
+            .rcode(),
+        Rcode::Refused
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sequence_reject_accepts_lowercase_text_rcode() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: seq
+    type: sequence
+    args:
+      - exec: reject servfail
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("seq")
+        .expect("sequence plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Stop));
+    assert_eq!(
+        context
+            .response()
+            .expect("reject should set a response")
+            .rcode(),
+        Rcode::ServFail
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sequence_reject_zero_returns_simple_noerror_response() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: seq
+    type: sequence
+    args:
+      - matches: qtype HTTPS
+        exec: reject 0
+      - exec: reject 2
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("seq")
+        .expect("sequence plugin should exist")
+        .to_executor();
+    let mut context = make_context_with_qtype(registry.clone(), "apple.com.", RecordType::HTTPS);
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Stop));
+    let response = context.response().expect("reject 0 should set a response");
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.answers().is_empty());
+    assert!(response.authorities().is_empty());
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-response")]
+#[tokio::test]
+async fn test_response_plugin_builds_soa_backed_nodata() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: suppress_https
+    type: response
+    args:
+      rcode: NOERROR
+      authorities:
+        - "{qname} 300 {qclass} SOA ns.example. hostmaster.example. 1 7200 1800 86400 300"
+  - tag: seq
+    type: sequence
+    args:
+      - matches: qtype HTTPS
+        exec: $suppress_https
+      - exec: reject SERVFAIL
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("seq")
+        .expect("sequence plugin should exist")
+        .to_executor();
+    let mut context = make_context_with_qtype(registry.clone(), "apple.com.", RecordType::HTTPS);
+
+    assert!(matches!(
+        sequence.execute(&mut context).await?,
+        ExecStep::Stop
+    ));
+    let response = context
+        .response()
+        .expect("response plugin should set a response");
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.answers().is_empty());
+    assert_eq!(response.authorities().len(), 1);
+    let soa = &response.authorities()[0];
+    assert_eq!(soa.name(), &Name::from_ascii("apple.com.")?);
+    assert_eq!(soa.class(), DNSClass::IN);
+    assert_eq!(soa.rr_type(), RecordType::SOA);
+    assert_eq!(soa.ttl(), 300);
+    let RData::SOA(soa_rdata) = soa.data() else {
+        panic!("authority record should carry SOA data");
+    };
+    assert_eq!(soa_rdata.minimum(), 300);
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sequence_jump_return_resumes_parent_execution() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: child
+    type: sequence
+    args:
+      - exec: mark 2
+      - exec: return
+      - exec: mark 3
+  - tag: parent
+    type: sequence
+    args:
+      - exec: mark 1
+      - exec: jump child
+      - exec: mark 4
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("parent")
+        .expect("parent sequence should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    assert!(context.marks().contains(&1));
+    assert!(context.marks().contains(&2));
+    assert!(!context.marks().contains(&3));
+    assert!(context.marks().contains(&4));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sequence_goto_does_not_resume_source_sequence() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: child
+    type: sequence
+    args:
+      - exec: mark 2
+      - exec: return
+      - exec: mark 3
+  - tag: parent
+    type: sequence
+    args:
+      - exec: mark 1
+      - exec: goto child
+      - exec: mark 4
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("parent")
+        .expect("parent sequence should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Return));
+    assert!(context.marks().contains(&1));
+    assert!(context.marks().contains(&2));
+    assert!(!context.marks().contains(&3));
+    assert!(!context.marks().contains(&4));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sequence_direct_child_return_propagates_to_parent_caller() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: child
+    type: sequence
+    args:
+      - exec: mark 2
+      - exec: return
+      - exec: mark 3
+  - tag: parent
+    type: sequence
+    args:
+      - exec: mark 1
+      - exec: $child
+      - exec: mark 4
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("parent")
+        .expect("parent sequence should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Return));
+    assert!(context.marks().contains(&1));
+    assert!(context.marks().contains(&2));
+    assert!(!context.marks().contains(&3));
+    assert!(!context.marks().contains(&4));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sequence_jump_short_circuit_child_stops_parent() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: child
+    type: sequence
+    args:
+      - exec: "black_hole 0.0.0.0 short_circuit=true"
+      - exec: mark 3
+  - tag: parent
+    type: sequence
+    args:
+      - exec: mark 1
+      - exec: jump child
+      - exec: mark 4
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("parent")
+        .expect("parent sequence should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Stop));
+    assert!(context.marks().contains(&1));
+    assert!(!context.marks().contains(&3));
+    assert!(!context.marks().contains(&4));
+    assert_eq!(
+        context
+            .response()
+            .expect("black_hole should synthesize a response")
+            .rcode(),
+        Rcode::NoError
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_black_hole_quick_setup_defaults_to_nxdomain() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: main
+    type: sequence
+    args:
+      - exec: "black_hole"
+      - exec: accept
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("main")
+        .expect("main sequence should exist")
+        .to_executor();
+    let mut context = make_context_with_qtype(registry.clone(), "example.com.", RecordType::TXT);
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Stop));
+    let response = context
+        .response()
+        .expect("black_hole should synthesize a response");
+    assert_eq!(response.rcode(), Rcode::NXDomain);
+    assert!(response.answers().is_empty());
+    assert_eq!(response.authorities().len(), 1);
+    assert_eq!(response.authorities()[0].rr_type(), RecordType::SOA);
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_black_hole_quick_setup_nodata_short_circuit_stops_sequence() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: main
+    type: sequence
+    args:
+      - exec: "black_hole nodata short_circuit=true"
+      - exec: mark 9
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("main")
+        .expect("main sequence should exist")
+        .to_executor();
+    let mut context = make_context_with_qtype(registry.clone(), "example.com.", RecordType::TXT);
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Stop));
+    assert!(!context.marks().contains(&9));
+    let response = context
+        .response()
+        .expect("black_hole should synthesize a response");
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.answers().is_empty());
+    assert_eq!(response.authorities().len(), 1);
+    assert_eq!(response.authorities()[0].rr_type(), RecordType::SOA);
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_black_hole_quick_setup_legacy_custom_covers_all_qtypes() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: main
+    type: sequence
+    args:
+      - exec: "black_hole 0.0.0.0 :: short_circuit=true"
+      - exec: mark 9
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("main")
+        .expect("main sequence should exist")
+        .to_executor();
+
+    let mut a_context = make_context(registry.clone(), "example.com.");
+    let a_step = sequence.execute(&mut a_context).await?;
+    assert!(matches!(a_step, ExecStep::Stop));
+    assert!(!a_context.marks().contains(&9));
+    let a_response = a_context
+        .response()
+        .expect("A black_hole response should exist");
+    assert_eq!(a_response.rcode(), Rcode::NoError);
+    assert_eq!(a_response.answers().len(), 1);
+    assert_eq!(a_response.answers()[0].rr_type(), RecordType::A);
+
+    let mut txt_context =
+        make_context_with_qtype(registry.clone(), "example.com.", RecordType::TXT);
+    let txt_step = sequence.execute(&mut txt_context).await?;
+    assert!(matches!(txt_step, ExecStep::Stop));
+    assert!(!txt_context.marks().contains(&9));
+    let txt_response = txt_context
+        .response()
+        .expect("TXT black_hole response should exist");
+    assert_eq!(txt_response.rcode(), Rcode::NoError);
+    assert!(txt_response.answers().is_empty());
+    assert_eq!(txt_response.authorities().len(), 1);
+    assert_eq!(txt_response.authorities()[0].rr_type(), RecordType::SOA);
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_udp_server_returns_hosts_answer_for_matching_query() -> Result<()> {
+    let mut registry_and_addr = None;
+    for _ in 0..16 {
+        let listen = reserve_local_udp_addr()?;
+        let yaml = format!(
+            r#"
+log:
+  level: info
+plugins:
+  - tag: hosts
+    type: hosts
+    args:
+      entries:
+        - "full:example.test 192.0.2.10"
+  - tag: udp
+    type: udp_server
+    args:
+      entry: hosts
+      listen: "{listen}"
+"#
+        );
+
+        let config = parse_config(&yaml)?;
+        match plugin::init(config).await {
+            Ok(registry) => {
+                registry_and_addr = Some((registry, listen));
+                break;
+            }
+            Err(err) if err.to_string().contains("Failed to bind UDP socket") => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    let (registry, listen) =
+        registry_and_addr.expect("UDP server should bind to a local port within retry budget");
+    let response_result = exchange_udp_query(listen, "example.test.").await;
+    registry.destroy().await;
+    let response = response_result?;
+
+    assert_eq!(response.id(), 0x1234);
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert_eq!(response.answers().len(), 1);
+    assert_eq!(response.answers()[0].rr_type(), RecordType::A);
+    assert_eq!(
+        response.answers()[0].data().ip_addr(),
+        Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))
+    );
+    Ok(())
+}
+
+fn bind_udp_reply_test_socket(listen: SocketAddr) -> std::io::Result<StdUdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(listen),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if listen.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+    // Match the server's dual-stack binding, but leave port reuse disabled so
+    // reservations cannot select an active listener's port in parallel tests.
+    socket.bind(&listen.into())?;
+    Ok(socket.into())
+}
+
+async fn rebind_udp_reply_test_socket(
+    listen: SocketAddr,
+    budget: Duration,
+) -> std::io::Result<StdUdpSocket> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match bind_udp_reply_test_socket(listen) {
+            Ok(socket) => return Ok(socket),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::AddrInUse
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                // Port reservations in parallel tests happen before they
+                // acquire the runtime lock. Allow a transient
+                // reservation to finish, but never enable reuse
+                // or accept a persistently held socket.
+                tokio::time::sleep_until(
+                    deadline.min(tokio::time::Instant::now() + Duration::from_millis(10)),
+                )
+                .await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_udp_reply_rebind_waits_for_temporary_reservation() -> std::io::Result<()> {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let reservation = bind_udp_reply_test_socket("127.0.0.1:0".parse().unwrap())?;
+    let listen = reservation.local_addr()?;
+    let mut rebind = Box::pin(rebind_udp_reply_test_socket(listen, Duration::from_secs(1)));
+    std::future::poll_fn(|cx| {
+        assert!(rebind.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(reservation);
+    let rebound = rebind.await?;
+    assert_eq!(rebound.local_addr()?, listen);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_udp_reply_rebind_rejects_retained_socket() -> std::io::Result<()> {
+    let retained = bind_udp_reply_test_socket("127.0.0.1:0".parse().unwrap())?;
+    let err = rebind_udp_reply_test_socket(retained.local_addr()?, Duration::from_millis(20))
+        .await
+        .expect_err("A retained socket must fail the shutdown check");
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    Ok(())
+}
+
+/// Exercise actual DNS responses, including concurrent queries from one source
+/// socket to different local server addresses. The runtime is destroyed even
+/// when an exchange or a wire/source-address assertion fails.
+async fn check_udp_reply_profile(
+    listen_ip: IpAddr,
+    client_ip: IpAddr,
+    destinations: &[IpAddr],
+) -> Result<()> {
+    let mut started = None;
+    for _ in 0..16 {
+        let reserved = bind_udp_reply_test_socket(SocketAddr::new(listen_ip, 0))?;
+        let listen = reserved.local_addr()?;
+        drop(reserved);
+        let large_answers = (1..=64)
+            .map(|i| format!("192.0.2.{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let config = parse_config(&format!(
+            r#"
+log:
+  level: error
+plugins:
+  - tag: reply_hosts
+    type: hosts
+    args:
+      entries:
+        - "full:example.test 192.0.2.10"
+        - "full:large.test {large_answers}"
+  - tag: reply_udp
+    type: udp_server
+    args:
+      entry: reply_hosts
+      listen: "{listen}"
+"#
+        ))?;
+        match plugin::init(config).await {
+            Ok(runtime) => {
+                started = Some((runtime, listen));
+                break;
+            }
+            Err(err) if err.to_string().contains("Failed to bind UDP socket") => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    let (runtime, listen) =
+        started.ok_or_else(|| DnsError::runtime("Failed to reserve UDP reply test port"))?;
+    let exchange = async {
+        let client = UdpSocket::bind(SocketAddr::new(client_ip, 0)).await?;
+        let mut request = Message::new();
+        request.add_question(Question::new(
+            Name::from_ascii("example.test.").unwrap(),
+            RecordType::A,
+            DNSClass::IN,
+        ));
+        // Keep multiple destinations in flight before collecting any replies.
+        const QUERIES: usize = 32;
+        for id in 0..QUERIES {
+            request.set_id(id as u16);
+            client
+                .send_to(
+                    &request.to_bytes()?,
+                    SocketAddr::new(destinations[id % destinations.len()], listen.port()),
+                )
+                .await?;
+        }
+        let mut seen = [false; QUERIES];
+        let mut buf = [0u8; 4096];
+        for _ in 0..QUERIES {
+            let (len, source) = timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+                .await
+                .map_err(|_| {
+                    let missing: Vec<_> = (0..QUERIES).filter(|id| !seen[*id]).collect();
+                    DnsError::runtime(format!(
+                        "UDP reply source test timed out: listen={listen}, client={client_ip}, \
+                         destinations={destinations:?}, missing IDs={missing:?}"
+                    ))
+                })??;
+            let response = Message::from_bytes(&buf[..len])?;
+            let id = usize::from(response.id());
+            if id >= QUERIES || seen[id] {
+                return Err(DnsError::runtime("Unexpected or duplicate UDP reply ID"));
+            }
+            let expected = SocketAddr::new(destinations[id % destinations.len()], listen.port());
+            if source != expected
+                || response.questions() != request.questions()
+                || response.message_type() != oxidns::proto::MessageType::Response
+                || response.rcode() != Rcode::NoError
+                || response.answers().len() != 1
+                || response.answers()[0].data().ip_addr() != Some("192.0.2.10".parse().unwrap())
+            {
+                return Err(DnsError::runtime(format!(
+                    "Invalid UDP reply: source {source}, expected {expected}, id {id}"
+                )));
+            }
+            seen[id] = true;
+        }
+        // Connected UDP filters out packets with the wrong source in the
+        // kernel.
+        for destination in destinations {
+            let client = UdpSocket::bind(SocketAddr::new(client_ip, 0)).await?;
+            client
+                .connect(SocketAddr::new(*destination, listen.port()))
+                .await?;
+            for payload in [None, Some(1232u16)] {
+                let mut request = Message::new();
+                request.set_id(0x341);
+                request.add_question(Question::new(
+                    Name::from_ascii("large.test.").unwrap(),
+                    RecordType::A,
+                    DNSClass::IN,
+                ));
+                if let Some(payload) = payload {
+                    let mut edns = oxidns::proto::Edns::new();
+                    edns.set_udp_payload_size(payload);
+                    request.set_edns(edns);
+                }
+                client.send(&request.to_bytes()?).await?;
+                let len = timeout(Duration::from_secs(2), client.recv(&mut buf))
+                    .await
+                    .map_err(|_| DnsError::runtime("Connected UDP reply test timed out"))??;
+                let response = Message::from_bytes(&buf[..len])?;
+                let limit = usize::from(payload.unwrap_or(512));
+                if len > limit
+                    || response.id() != request.id()
+                    || response.questions() != request.questions()
+                    || response.rcode() != Rcode::NoError
+                    || response.message_type() != oxidns::proto::MessageType::Response
+                    || response.truncated() != payload.is_none()
+                    || (payload.is_some() && response.answers().len() != 64)
+                {
+                    return Err(DnsError::runtime(
+                        "UDP reply changed DNS or EDNS truncation semantics",
+                    ));
+                }
+            }
+        }
+        // Keep the runtime's test serialization guard until the shutdown
+        // assertion completes. Destroying the whole runtime first would let
+        // the next test start a listener before we check this port.
+        let server = runtime
+            .get_plugin("reply_udp")
+            .expect("UDP reply test server should exist");
+        timeout(Duration::from_secs(3), server.as_plugin().destroy())
+            .await
+            .map_err(|_| DnsError::runtime("UDP reply test server shutdown timed out"))??;
+        // Do not enable reuse here: a retained listener must fail this check.
+        let rebound = rebind_udp_reply_test_socket(listen, Duration::from_secs(1))
+            .await
+            .map_err(|err| {
+                DnsError::runtime(format!(
+                    "UDP reply test could not rebind {listen} after shutdown: {err}"
+                ))
+            })?;
+        drop(rebound);
+        Ok::<(), DnsError>(())
+    }
+    .await;
+    timeout(Duration::from_secs(3), runtime.destroy())
+        .await
+        .map_err(|_| DnsError::runtime("UDP reply test shutdown timed out"))?;
+    exchange
+}
+
+#[tokio::test]
+async fn test_udp_server_reply_sources_and_payload_limits() -> Result<()> {
+    for (listen, client) in [
+        ("0.0.0.0", "127.0.0.1"),
+        ("::", "127.0.0.1"),
+        ("::", "::1"),
+        ("127.0.0.1", "127.0.0.1"),
+        ("::1", "::1"),
+    ] {
+        let client = client.parse().unwrap();
+        check_udp_reply_profile(listen.parse().unwrap(), client, &[client]).await?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_udp_server_reply_sources_on_secondary_loopback() -> Result<()> {
+    let destinations = ["127.0.0.2".parse().unwrap(), "127.0.0.3".parse().unwrap()];
+    for listen in ["0.0.0.0", "::"] {
+        check_udp_reply_profile(
+            listen.parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            &destinations,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_udp_server_multihomed_reply_sources() -> Result<()> {
+    const PARENT_NAMESPACE: &str = "OXIDNS_UDP_TEST_PARENT_NETNS";
+    if let Some(parent_namespace) = std::env::var_os(PARENT_NAMESPACE) {
+        // Refuse to configure addresses if the subprocess was not isolated.
+        let namespace = fs::read_link("/proc/self/ns/net")?;
+        if namespace.as_os_str() == parent_namespace.as_os_str() {
+            return Err(DnsError::runtime(
+                "UDP test requires a new network namespace",
+            ));
+        }
+    } else {
+        // Re-execute only this test in a new process: changing a test runner's
+        // namespace in place would affect unrelated tests or runtime threads.
+        let namespace = match fs::read_link("/proc/self/ns/net") {
+            Ok(namespace) => namespace,
+            Err(err) => {
+                eprintln!("Skipping UDP multihomed test: cannot inspect network namespace: {err}");
+                return Ok(());
+            }
+        };
+        let Some(mut command) = udp_test_namespace_command().await else {
+            return Ok(());
+        };
+        command
+            .arg("env")
+            // Set the child marker after sudo's environment filtering.
+            .arg(format!("{PARENT_NAMESPACE}={}", namespace.display()))
+            .arg(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "test_udp_server_multihomed_reply_sources",
+                "--nocapture",
+            ])
+            .kill_on_drop(true);
+        let mut child = command.spawn()?;
+        let status = timeout(Duration::from_secs(30), child.wait())
+            .await
+            .map_err(|_| DnsError::runtime("UDP network namespace test timed out"))??;
+        if !status.success() {
+            return Err(DnsError::runtime(format!(
+                "UDP network namespace test failed: {status}"
+            )));
+        }
+        return Ok(());
+    }
+
+    // This anonymous namespace is owned by the child process. The kernel
+    // removes its interfaces and addresses on exit, including test failures.
+    let setup: &[&[&str]] = &[
+        &["link", "set", "lo", "up"],
+        &["link", "add", "lan", "type", "dummy"],
+        &["link", "add", "bridge", "type", "dummy"],
+        &["link", "set", "lan", "up"],
+        &["link", "set", "bridge", "up"],
+        &["addr", "add", "192.0.2.1/24", "dev", "lan"],
+        &["addr", "add", "198.51.100.1/24", "dev", "bridge"],
+        &["addr", "add", "198.51.100.10/24", "dev", "bridge"],
+        &["-6", "addr", "add", "fd00:341::1/64", "dev", "lan", "nodad"],
+        // The target remains valid, but is excluded from preferred sources.
+        &[
+            "-6",
+            "addr",
+            "add",
+            "fd00:341::2/64",
+            "dev",
+            "lan",
+            "nodad",
+            "preferred_lft",
+            "0",
+        ],
+        &[
+            "-6",
+            "addr",
+            "add",
+            "fd00:341::10/64",
+            "dev",
+            "lan",
+            "nodad",
+        ],
+    ];
+    for args in setup {
+        run_command("ip", args)?;
+    }
+    let v4: [IpAddr; 2] = [
+        "192.0.2.1".parse().unwrap(),
+        "198.51.100.1".parse().unwrap(),
+    ];
+    let v6: [IpAddr; 2] = [
+        "fd00:341::1".parse().unwrap(),
+        "fd00:341::2".parse().unwrap(),
+    ];
+    // A passing DNS exchange only proves the fix if the same fixture makes
+    // ordinary wildcard recv_from/send_to choose a different source address.
+    for (client_ip, destination) in [("198.51.100.10", v4[0]), ("fd00:341::10", v6[1])] {
+        let client_ip: IpAddr = client_ip.parse().unwrap();
+        let wildcard = if client_ip.is_ipv4() {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        };
+        let source = timeout(Duration::from_secs(2), async {
+            let server = UdpSocket::bind(SocketAddr::new(wildcard, 0)).await?;
+            let client = UdpSocket::bind(SocketAddr::new(client_ip, 0)).await?;
+            client
+                .send_to(
+                    b"fixture",
+                    SocketAddr::new(destination, server.local_addr()?.port()),
+                )
+                .await?;
+            let mut buf = [0; 64];
+            let (len, peer) = server.recv_from(&mut buf).await?;
+            server.send_to(&buf[..len], peer).await?;
+            let (len, source) = client.recv_from(&mut buf).await?;
+            if &buf[..len] != b"fixture" {
+                return Err(DnsError::runtime("Unexpected UDP fixture reply"));
+            }
+            Ok::<_, DnsError>(source)
+        })
+        .await
+        .map_err(|_| DnsError::runtime("UDP source selection fixture timed out"))??;
+        if source.ip() == destination {
+            return Err(DnsError::runtime(format!(
+                "Fixture does not reproduce source mismatch for {destination}"
+            )));
+        }
+        println!("Verified default source mismatch: query={destination}, reply={source}");
+    }
+    for listen in ["0.0.0.0", "::", "192.0.2.1"] {
+        let targets = if listen == "192.0.2.1" {
+            &v4[..1]
+        } else {
+            &v4[..]
+        };
+        check_udp_reply_profile(
+            listen.parse().unwrap(),
+            "198.51.100.10".parse().unwrap(),
+            targets,
+        )
+        .await?;
+    }
+    for listen in ["::", "fd00:341::2"] {
+        let targets = if listen == "::" { &v6[..] } else { &v6[1..] };
+        check_udp_reply_profile(
+            listen.parse().unwrap(),
+            "fd00:341::10".parse().unwrap(),
+            targets,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn udp_test_namespace_command() -> Option<tokio::process::Command> {
+    // UID 0 does not imply CAP_SYS_ADMIN or CAP_NET_ADMIN (e.g. containers).
+    // Probe the actual launch path, including ip and timeout, in a disposable
+    // namespace. Never change interfaces in the test runner's namespace.
+    let launchers: &[(&str, &[&str])] = &[
+        (
+            "timeout",
+            &["--kill-after=5s", "20s", "unshare", "--net", "--"],
+        ),
+        (
+            "timeout",
+            &[
+                "--kill-after=5s",
+                "20s",
+                "unshare",
+                "--user",
+                "--map-root-user",
+                "--net",
+                "--",
+            ],
+        ),
+        (
+            "sudo",
+            &[
+                "-n",
+                "--",
+                "timeout",
+                "--kill-after=5s",
+                "20s",
+                "unshare",
+                "--net",
+                "--",
+            ],
+        ),
+    ];
+    let mut unavailable = Vec::new();
+    for (program, args) in launchers {
+        let mut probe = tokio::process::Command::new(program);
+        probe
+            .args(*args)
+            .args(["ip", "link", "set", "lo", "up"])
+            .kill_on_drop(true);
+        let reason = match timeout(Duration::from_secs(30), probe.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                let mut command = tokio::process::Command::new(program);
+                command.args(*args);
+                return Some(command);
+            }
+            Ok(Ok(output)) => format!(
+                "{}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Ok(Err(err)) => err.to_string(),
+            Err(_) => "probe timed out".to_owned(),
+        };
+        unavailable.push(format!("{program} {}: {reason}", args.join(" ")));
+    }
+    // This environment-only skip keeps ordinary cargo test usable without
+    // extra privileges/tools. Once a probe succeeds, all fixture and DNS
+    // failures propagate; they must never turn into a skip.
+    eprintln!(
+        "Skipping UDP multihomed test: no usable network namespace launcher:\n{}",
+        unavailable.join("\n")
+    );
+    None
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_udp_namespace_environment_checks() -> Result<()> {
+    let empty_path = TempDir::new()?;
+    let mut command = tokio::process::Command::new(std::env::current_exe()?);
+    command
+        .args([
+            "--exact",
+            "test_udp_server_multihomed_reply_sources",
+            "--nocapture",
+        ])
+        .env("PATH", empty_path.path())
+        .env_remove("OXIDNS_UDP_TEST_PARENT_NETNS")
+        .kill_on_drop(true);
+    let output = timeout(Duration::from_secs(5), command.output())
+        .await
+        .map_err(|_| DnsError::runtime("UDP namespace availability check timed out"))??;
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Skipping UDP multihomed test"));
+
+    // An isolation failure must remain a failure even when tools are absent.
+    command.env(
+        "OXIDNS_UDP_TEST_PARENT_NETNS",
+        fs::read_link("/proc/self/ns/net")?,
+    );
+    let output = timeout(Duration::from_secs(5), command.output())
+        .await
+        .map_err(|_| DnsError::runtime("UDP namespace isolation check timed out"))??;
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("UDP test requires a new network namespace")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hosts_short_circuit_stops_sequence_after_local_answer() -> Result<()> {
+    let mut registry_and_addr = None;
+    for _ in 0..16 {
+        let listen = reserve_local_udp_addr()?;
+        let yaml = format!(
+            r#"
+log:
+  level: info
+plugins:
+  - tag: hosts
+    type: hosts
+    args:
+      entries:
+        - "full:example.test 192.0.2.10"
+      short_circuit: true
+  - tag: seq
+    type: sequence
+    args:
+      - exec: $hosts
+      - exec: "reject 2"
+  - tag: udp
+    type: udp_server
+    args:
+      entry: seq
+      listen: "{listen}"
+"#
+        );
+
+        let config = parse_config(&yaml)?;
+        match plugin::init(config).await {
+            Ok(registry) => {
+                registry_and_addr = Some((registry, listen));
+                break;
+            }
+            Err(err) if err.to_string().contains("Failed to bind UDP socket") => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    let (registry, listen) =
+        registry_and_addr.expect("UDP server should bind to a local port within retry budget");
+    let response_result = exchange_udp_query(listen, "example.test.").await;
+    registry.destroy().await;
+    let response = response_result?;
+
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert_eq!(response.answers().len(), 1);
+    assert_eq!(
+        response.answers()[0].data().ip_addr(),
+        Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_udp_server_hosts_file_rules_override_inline_entries() -> Result<()> {
+    let tmp_dir = TempDir::new().expect("temp dir should be created");
+    let hosts_file = tmp_dir.path().join("hosts.txt");
+    std::fs::write(&hosts_file, "full:example.test 192.0.2.11\n")?;
+    let file_path = yaml_path(&hosts_file);
+
+    let mut registry_and_addr = None;
+    for _ in 0..16 {
+        let listen = reserve_local_udp_addr()?;
+        let yaml = format!(
+            r#"
+log:
+  level: info
+plugins:
+  - tag: hosts
+    type: hosts
+    args:
+      entries:
+        - "full:example.test 192.0.2.10"
+      files:
+        - "{file_path}"
+  - tag: udp
+    type: udp_server
+    args:
+      entry: hosts
+      listen: "{listen}"
+"#
+        );
+
+        let config = parse_config(&yaml)?;
+        match plugin::init(config).await {
+            Ok(registry) => {
+                registry_and_addr = Some((registry, listen));
+                break;
+            }
+            Err(err) if err.to_string().contains("Failed to bind UDP socket") => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    let (registry, listen) =
+        registry_and_addr.expect("UDP server should bind to a local port within retry budget");
+    let response_result = exchange_udp_query(listen, "example.test.").await;
+    registry.destroy().await;
+    let response = response_result?;
+
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert_eq!(
+        response.answers()[0].data().ip_addr(),
+        Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11)))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hosts_short_circuit_stops_sequence_after_local_nodata_answer() -> Result<()> {
+    let mut registry_and_addr = None;
+    for _ in 0..16 {
+        let listen = reserve_local_udp_addr()?;
+        let yaml = format!(
+            r#"
+log:
+  level: info
+plugins:
+  - tag: hosts
+    type: hosts
+    args:
+      entries:
+        - "full:example.test 192.0.2.10"
+      short_circuit: true
+  - tag: seq
+    type: sequence
+    args:
+      - exec: $hosts
+      - exec: "reject 2"
+  - tag: udp
+    type: udp_server
+    args:
+      entry: seq
+      listen: "{listen}"
+"#
+        );
+
+        let config = parse_config(&yaml)?;
+        match plugin::init(config).await {
+            Ok(registry) => {
+                registry_and_addr = Some((registry, listen));
+                break;
+            }
+            Err(err) if err.to_string().contains("Failed to bind UDP socket") => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    let (registry, listen) =
+        registry_and_addr.expect("UDP server should bind to a local port within retry budget");
+    let response_result =
+        exchange_udp_query_with_qtype(listen, "example.test.", RecordType::AAAA).await;
+    registry.destroy().await;
+    let response = response_result?;
+
+    assert_eq!(response.rcode(), Rcode::NoError);
+    assert!(response.answers().is_empty());
+    assert_eq!(response.authorities().len(), 1);
+    assert_eq!(response.authorities()[0].rr_type(), RecordType::SOA);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_cache_quick_setup_short_circuit_stops_sequence_after_cache_hit() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: hosts
+    type: hosts
+    args:
+      entries:
+        - "full:example.test 192.0.2.10"
+      short_circuit: true
+  - tag: seq
+    type: sequence
+    args:
+      - exec: "cache short_circuit=true"
+      - exec: $hosts
+      - exec: "reject 2"
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let seq = registry
+        .get_plugin("seq")
+        .expect("sequence should exist")
+        .to_executor();
+
+    let mut first_ctx = make_context(registry.clone(), "example.test.");
+    let first_step = seq.execute(&mut first_ctx).await?;
+    assert!(matches!(first_step, ExecStep::Stop));
+    assert_eq!(
+        first_ctx.response().expect("response should exist").rcode(),
+        Rcode::NoError
+    );
+
+    let mut second_ctx = make_context(registry.clone(), "example.test.");
+    let second_step = seq.execute(&mut second_ctx).await?;
+    assert!(matches!(second_step, ExecStep::Stop));
+    assert_eq!(
+        second_ctx
+            .response()
+            .expect("response should exist")
+            .rcode(),
+        Rcode::NoError
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-ip-selector")]
+#[tokio::test]
+async fn test_ip_selector_plugin_init_accepts_full_config_and_quick_setup() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: ip_select
+    type: ip_selector
+    args:
+      selection_mode: best_within_budget
+      probe_methods: "tcp:443,tcp:80"
+      probe_stagger: 0
+      probe_timeout: 50
+      max_wait: 100
+      top_n: 0
+      dnssec_policy: reorder_only
+      max_parallel_probes: 4
+      cache:
+        enabled: true
+        size: 16
+        ttl: 60
+        failure_ttl: 1
+  - tag: seq
+    type: sequence
+    args:
+      - exec: "ip_selector background none"
+      - exec: $ip_select
+      - exec: accept
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    assert!(registry.get_plugin("ip_select").is_some());
+    assert!(registry.get_plugin("seq").is_some());
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-ip-selector")]
+#[tokio::test]
+async fn test_ip_selector_recommended_chain_keeps_cache_response_uncut() -> Result<()> {
+    let probe_addr = start_tcp_probe_server().await?;
+    let probe_port = probe_addr.port();
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: ip_top1
+    type: ip_selector
+    args:
+      selection_mode: first_success
+      probe_methods: ["tcp:{probe_port}"]
+      probe_stagger: 0
+      probe_timeout: 80
+      max_wait: 200
+      top_n: 1
+      cache:
+        enabled: false
+  - tag: ip_reorder
+    type: ip_selector
+    args:
+      selection_mode: first_success
+      probe_methods: ["tcp:{probe_port}"]
+      probe_stagger: 0
+      probe_timeout: 80
+      max_wait: 200
+      top_n: 0
+      cache:
+        enabled: false
+  - tag: cache_main
+    type: cache
+    args:
+      short_circuit: true
+  - tag: hosts
+    type: hosts
+    args:
+      entries:
+        - "full:example.test 192.0.2.1 127.0.0.1"
+  - tag: seq_top1
+    type: sequence
+    args:
+      - exec: $ip_top1
+      - exec: $cache_main
+      - exec: $hosts
+      - exec: accept
+  - tag: seq_reorder
+    type: sequence
+    args:
+      - exec: $ip_reorder
+      - exec: $cache_main
+      - exec: $hosts
+      - exec: accept
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let seq_top1 = registry
+        .get_plugin("seq_top1")
+        .expect("seq_top1 should exist")
+        .to_executor();
+    let seq_reorder = registry
+        .get_plugin("seq_reorder")
+        .expect("seq_reorder should exist")
+        .to_executor();
+
+    let mut first_ctx = make_context(registry.clone(), "example.test.");
+    seq_top1.execute(&mut first_ctx).await?;
+    assert_eq!(
+        first_ctx
+            .response()
+            .expect("response should exist")
+            .answer_ips(),
+        vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
+    );
+
+    let mut second_ctx = make_context(registry.clone(), "example.test.");
+    seq_reorder.execute(&mut second_ctx).await?;
+    assert_eq!(
+        second_ctx
+            .response()
+            .expect("response should exist")
+            .answer_ips(),
+        vec![
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+        ],
+        "cache should retain the raw upstream/hosts RRset; ip_selector applies final shaping on return"
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_unused_provider_plugins_are_skipped_at_runtime() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: orphan_domain
+    type: domain_set
+    args:
+      exps:
+        - example.com
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    assert_eq!(registry.plugin_count(), 0);
+    assert!(registry.get_plugin("orphan_domain").is_none());
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_unused_provider_chains_are_skipped_transitively() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: shared_domain
+    type: domain_set
+    args:
+      exps:
+        - shared.example
+  - tag: combined_domain
+    type: domain_set
+    args:
+      exps:
+        - full:local.example
+      sets:
+        - shared_domain
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    assert_eq!(registry.plugin_count(), 0);
+    assert!(registry.get_plugin("shared_domain").is_none());
+    assert!(registry.get_plugin("combined_domain").is_none());
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_domain_set_provider_references_composed_providers() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: shared_domain
+    type: domain_set
+    args:
+      exps:
+        - shared.example
+  - tag: combined_domain
+    type: domain_set
+    args:
+      exps:
+        - full:local.example
+      sets:
+        - shared_domain
+  - tag: domain_match
+    type: qname
+    args:
+      - "$combined_domain"
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let matcher = registry
+        .get_plugin("domain_match")
+        .expect("domain matcher should exist")
+        .to_matcher();
+
+    let mut local_ctx = make_context(registry.clone(), "local.example.");
+    assert!(matcher.is_match(&mut local_ctx));
+
+    let mut shared_ctx = make_context(registry.clone(), "www.shared.example.");
+    assert!(matcher.is_match(&mut shared_ctx));
+
+    let mut missing_ctx = make_context(registry.clone(), "missing.example.");
+    assert!(!matcher.is_match(&mut missing_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "provider-adguard-rule")]
+#[tokio::test]
+async fn test_domain_set_can_compose_adguard_rule_provider() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: ad_rules
+    type: adguard_rule
+    args:
+      rules:
+        - "||ads.example^"
+        - "@@||safe.ads.example^"
+        - "||ipv6-only.example^$dnstype=AAAA"
+  - tag: combined_domain
+    type: domain_set
+    args:
+      sets:
+        - ad_rules
+  - tag: qname_match
+    type: qname
+    args:
+      - "$combined_domain"
+  - tag: question_match
+    type: question
+    args:
+      - "$combined_domain"
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let qname_matcher = registry
+        .get_plugin("qname_match")
+        .expect("qname matcher should exist")
+        .to_matcher();
+    let question_matcher = registry
+        .get_plugin("question_match")
+        .expect("question matcher should exist")
+        .to_matcher();
+
+    let mut blocked_ctx = make_context(registry.clone(), "cdn.ads.example.");
+    assert!(qname_matcher.is_match(&mut blocked_ctx));
+
+    let mut exception_ctx = make_context(registry.clone(), "safe.ads.example.");
+    assert!(!qname_matcher.is_match(&mut exception_ctx));
+
+    let mut a_ctx = make_context_with_qtype(registry.clone(), "ipv6-only.example.", RecordType::A);
+    assert!(!question_matcher.is_match(&mut a_ctx));
+
+    let mut aaaa_ctx =
+        make_context_with_qtype(registry.clone(), "ipv6-only.example.", RecordType::AAAA);
+    assert!(question_matcher.is_match(&mut aaaa_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_domain_set_provider_loads_rules_from_file() -> Result<()> {
+    let domain_rules = test_rule_path("domain_set_1.txt");
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: domain_rules
+    type: domain_set
+    args:
+      files:
+        - "{domain_rules}"
+  - tag: domain_match
+    type: qname
+    args:
+      - "$domain_rules"
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let matcher = registry
+        .get_plugin("domain_match")
+        .expect("domain matcher should exist")
+        .to_matcher();
+
+    let matching_names = [
+        "www.example.test.",
+        "img.cdn.example.test.",
+        "exact-only.test.",
+        "cdn.analytics-node.test.",
+        "api12.service.test.",
+    ];
+    for qname in matching_names {
+        let mut ctx = make_context(registry.clone(), qname);
+        assert!(matcher.is_match(&mut ctx), "{qname} should match");
+    }
+
+    let missing_names = [
+        "www.exact-only.test.",
+        "api.service.test.",
+        "missing.example.",
+    ];
+    for qname in missing_names {
+        let mut ctx = make_context(registry.clone(), qname);
+        assert!(!matcher.is_match(&mut ctx), "{qname} should not match");
+    }
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_qname_matcher_loads_regex_rule_with_comma_from_file() -> Result<()> {
+    let domain_rules = test_rule_path("domain_set_1.txt");
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: domain_match
+    type: qname
+    args:
+      - "&{domain_rules}"
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let matcher = registry
+        .get_plugin("domain_match")
+        .expect("domain matcher should exist")
+        .to_matcher();
+
+    let mut matching_ctx = make_context(registry.clone(), "api12.service.test.");
+    assert!(matcher.is_match(&mut matching_ctx));
+
+    let mut non_matching_ctx = make_context(registry.clone(), "api123.service.test.");
+    assert!(!matcher.is_match(&mut non_matching_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-dynamic-domain")]
+#[tokio::test]
+async fn test_dynamic_domain_set_learns_through_sequence_and_parent_domain_set() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let learned_file = temp_dir.path().join("learned-domains.txt");
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: learned_domains
+    type: dynamic_domain_set
+    args:
+      path: "{}"
+      batch_size: 1
+      flush_interval_ms: 10
+  - tag: learn_success
+    type: learn_domain
+    args:
+      provider: learned_domains
+      phase: after
+      async: false
+      rule_kind: full
+      qtypes:
+        - A
+      success_only: true
+      answer_required: true
+  - tag: learn_seq
+    type: sequence
+    args:
+      - exec: "$learn_success"
+  - tag: combined_domains
+    type: domain_set
+    args:
+      sets:
+        - learned_domains
+  - tag: match_learned
+    type: qname
+    args:
+      - "$combined_domains"
+"#,
+        yaml_path(&learned_file)
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let matcher = registry
+        .get_plugin("match_learned")
+        .expect("qname matcher should exist")
+        .to_matcher();
+    let executor = registry
+        .get_plugin("learn_seq")
+        .expect("sequence executor should exist")
+        .to_executor();
+
+    let mut before_ctx = make_context(registry.clone(), "learned.example.");
+    assert!(!matcher.is_match(&mut before_ctx));
+
+    let mut learn_ctx = make_context(registry.clone(), "learned.example.");
+    let mut response = learn_ctx.request().response(Rcode::NoError);
+    response.answers_mut().push(Record::from_rdata(
+        Name::from_ascii("learned.example.").expect("answer name"),
+        60,
+        RData::A(A(Ipv4Addr::new(192, 0, 2, 9))),
+    ));
+    learn_ctx.set_response(response);
+    assert!(matches!(
+        executor.execute(&mut learn_ctx).await?,
+        ExecStep::Next
+    ));
+
+    let mut after_ctx = make_context(registry.clone(), "learned.example.");
+    assert!(matcher.is_match(&mut after_ctx));
+    assert_eq!(
+        std::fs::read_to_string(&learned_file)?,
+        "full:learned.example\n"
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-dynamic-domain")]
+#[tokio::test]
+async fn test_learn_domain_rejects_non_dynamic_domain_set_provider() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: static_domains
+    type: domain_set
+    args:
+      exps:
+        - example.com
+  - tag: learn_static
+    type: learn_domain
+    args:
+      provider: static_domains
+  - tag: seq
+    type: sequence
+    args:
+      - exec: "$learn_static"
+"#;
+
+    let config = parse_config(yaml)?;
+    let err = plugin::init(config)
+        .await
+        .expect_err("learn_domain should reject regular domain_set provider");
+    let msg = err.to_string();
+
+    assert!(msg.contains("plugin 'learn_static'"));
+    assert!(msg.contains("args.provider"));
+    assert!(msg.contains("dynamic_domain_set"));
+    assert!(msg.contains("static_domains"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ip_set_provider_references_composed_providers() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: shared_ip
+    type: ip_set
+    args:
+      ips:
+        - 203.0.113.7
+  - tag: combined_ip
+    type: ip_set
+    args:
+      ips:
+        - 198.51.100.0/24
+      sets:
+        - shared_ip
+  - tag: match_client
+    type: client_ip
+    args:
+      - "$combined_ip"
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let matcher = registry
+        .get_plugin("match_client")
+        .expect("client matcher should exist")
+        .to_matcher();
+
+    let mut shared_ctx = make_context(registry.clone(), "example.com.");
+    shared_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 5300)));
+    assert!(matcher.is_match(&mut shared_ctx));
+
+    let mut range_ctx = make_context(registry.clone(), "example.com.");
+    range_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(198, 51, 100, 42), 5300)));
+    assert!(matcher.is_match(&mut range_ctx));
+
+    let mut missing_ctx = make_context(registry.clone(), "example.com.");
+    missing_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(198, 51, 101, 1), 5300)));
+    assert!(!matcher.is_match(&mut missing_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ip_set_provider_loads_rules_from_file() -> Result<()> {
+    let ip_rules = test_rule_path("ip_set_1.txt");
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: ip_rules
+    type: ip_set
+    args:
+      files:
+        - "{ip_rules}"
+  - tag: match_client
+    type: client_ip
+    args:
+      - "$ip_rules"
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let matcher = registry
+        .get_plugin("match_client")
+        .expect("client matcher should exist")
+        .to_matcher();
+
+    for ip in [
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 42)),
+        IpAddr::V6(Ipv6Addr::from([0x2001, 0xDB8, 0, 0, 0, 0, 0, 7])),
+        IpAddr::V6(Ipv6Addr::from([0x2001, 0xDB8, 0xABCD, 0, 0, 0, 0, 0x1234])),
+    ] {
+        let mut ctx = make_context(registry.clone(), "example.com.");
+        ctx.set_peer_addr(SocketAddr::new(ip, 5300));
+        assert!(matcher.is_match(&mut ctx), "{ip} should match");
+    }
+
+    for ip in [
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 101, 1)),
+        IpAddr::V6(Ipv6Addr::from([0x2001, 0xDB8, 0, 0, 0, 0, 0, 8])),
+        IpAddr::V6(Ipv6Addr::from([0x2001, 0xDB8, 0xABCE, 0, 0, 0, 0, 1])),
+    ] {
+        let mut ctx = make_context(registry.clone(), "example.com.");
+        ctx.set_peer_addr(SocketAddr::new(ip, 5300));
+        assert!(!matcher.is_match(&mut ctx), "{ip} should not match");
+    }
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_client_ip_matcher_loads_rules_from_file() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let ip_rules = temp_dir.path().join("client_ip_rules.txt");
+    fs::write(&ip_rules, "203.0.113.7\n198.51.100.0/24\n2001:db8::7\n")?;
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: match_client
+    type: client_ip
+    args:
+      - "&{}"
+"#,
+        yaml_path(&ip_rules)
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let matcher = registry
+        .get_plugin("match_client")
+        .expect("client matcher should exist")
+        .to_matcher();
+
+    for ip in [
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 42)),
+        IpAddr::V6(Ipv6Addr::from([0x2001, 0xDB8, 0, 0, 0, 0, 0, 7])),
+    ] {
+        let mut ctx = make_context(registry.clone(), "example.com.");
+        ctx.set_peer_addr(SocketAddr::new(ip, 5300));
+        assert!(matcher.is_match(&mut ctx), "{ip} should match");
+    }
+
+    let mut missing_ctx = make_context(registry.clone(), "example.com.");
+    missing_ctx.set_peer_addr(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)),
+        5300,
+    ));
+    assert!(!matcher.is_match(&mut missing_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "provider-protobuf")]
+#[tokio::test]
+async fn test_geoip_provider_loads_cn_rules_and_is_case_insensitive() -> Result<()> {
+    let geoip_dat = test_rule_path("geoip.dat");
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: geoip_cn
+    type: geoip
+    args:
+      file: "{geoip_dat}"
+      selectors:
+        - "CN"
+  - tag: match_client
+    type: client_ip
+    args:
+      - "$geoip_cn"
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let matcher = registry
+        .get_plugin("match_client")
+        .expect("client matcher should exist")
+        .to_matcher();
+
+    let mut cn_ctx = make_context(registry.clone(), "example.com.");
+    cn_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(1, 0, 1, 1), 5300)));
+    assert!(matcher.is_match(&mut cn_ctx));
+
+    let mut foreign_ctx = make_context(registry.clone(), "example.com.");
+    foreign_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 5300)));
+    assert!(!matcher.is_match(&mut foreign_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "provider-protobuf")]
+#[tokio::test]
+async fn test_geoip_provider_without_selectors_loads_full_union() -> Result<()> {
+    let geoip_dat = test_rule_path("geoip.dat");
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: geoip_all
+    type: geoip
+    args:
+      file: "{geoip_dat}"
+  - tag: match_client
+    type: client_ip
+    args:
+      - "$geoip_all"
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let matcher = registry
+        .get_plugin("match_client")
+        .expect("client matcher should exist")
+        .to_matcher();
+
+    let mut cn_ctx = make_context(registry.clone(), "example.com.");
+    cn_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(1, 0, 1, 1), 5300)));
+    assert!(matcher.is_match(&mut cn_ctx));
+
+    let mut foreign_ctx = make_context(registry.clone(), "example.com.");
+    foreign_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(8, 8, 8, 8), 5300)));
+    assert!(matcher.is_match(&mut foreign_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "provider-protobuf")]
+#[tokio::test]
+async fn test_geosite_provider_loads_requested_selectors_and_supports_question() -> Result<()> {
+    let geosite_dat = test_rule_path("geosite.dat");
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: geosite_target
+    type: geosite
+    args:
+      file: "{geosite_dat}"
+      selectors:
+        - "cn"
+        - "geolocation-!cn"
+  - tag: match_qname
+    type: qname
+    args:
+      - "$geosite_target"
+  - tag: match_question
+    type: question
+    args:
+      - "$geosite_target"
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let qname_matcher = registry
+        .get_plugin("match_qname")
+        .expect("qname matcher should exist")
+        .to_matcher();
+    let question_matcher = registry
+        .get_plugin("match_question")
+        .expect("question matcher should exist")
+        .to_matcher();
+
+    let mut cn_ctx = make_context(registry.clone(), "265.com.");
+    assert!(qname_matcher.is_match(&mut cn_ctx));
+
+    let mut foreign_ctx = make_context(registry.clone(), "a.ppy.sh.");
+    assert!(qname_matcher.is_match(&mut foreign_ctx));
+
+    let mut question_ctx = make_context_with_qtype(registry.clone(), "a.ppy.sh.", RecordType::A);
+    assert!(question_matcher.is_match(&mut question_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "provider-protobuf")]
+#[tokio::test]
+async fn test_geosite_provider_without_selectors_loads_full_union() -> Result<()> {
+    let geosite_dat = test_rule_path("geosite.dat");
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: geosite_all
+    type: geosite
+    args:
+      file: "{geosite_dat}"
+  - tag: match_qname
+    type: qname
+    args:
+      - "$geosite_all"
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let matcher = registry
+        .get_plugin("match_qname")
+        .expect("qname matcher should exist")
+        .to_matcher();
+
+    let mut cn_ctx = make_context(registry.clone(), "265.com.");
+    assert!(matcher.is_match(&mut cn_ctx));
+
+    let mut foreign_ctx = make_context(registry.clone(), "a.ppy.sh.");
+    assert!(matcher.is_match(&mut foreign_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "provider-protobuf")]
+#[tokio::test]
+async fn test_geosite_provider_supports_code_attribute_selector() -> Result<()> {
+    let geosite_dat = test_rule_path("geosite.dat");
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: geosite_mastercard_cn
+    type: geosite
+    args:
+      file: "{geosite_dat}"
+      selectors:
+        - "mastercard@cn"
+  - tag: match_qname
+    type: qname
+    args:
+      - "$geosite_mastercard_cn"
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let matcher = registry
+        .get_plugin("match_qname")
+        .expect("qname matcher should exist")
+        .to_matcher();
+
+    let mut cn_ctx = make_context(registry.clone(), "mastercard.cn.");
+    assert!(matcher.is_match(&mut cn_ctx));
+
+    let mut foreign_ctx = make_context(registry.clone(), "a.ppy.sh.");
+    assert!(!matcher.is_match(&mut foreign_ctx));
+
+    let mut global_ctx = make_context(registry.clone(), "mastercard.com.");
+    assert!(!matcher.is_match(&mut global_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "provider-protobuf")]
+#[tokio::test]
+async fn test_matchers_can_reference_geo_providers_directly() -> Result<()> {
+    let geoip_dat = test_rule_path("geoip.dat");
+    let geosite_dat = test_rule_path("geosite.dat");
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: geoip_cn
+    type: geoip
+    args:
+      file: "{geoip_dat}"
+      selectors: ["cn"]
+  - tag: geosite_cn
+    type: geosite
+    args:
+      file: "{geosite_dat}"
+      selectors: ["cn"]
+  - tag: geosite_foreign
+    type: geosite
+    args:
+      file: "{geosite_dat}"
+      selectors: ["geolocation-!cn"]
+  - tag: match_client
+    type: client_ip
+    args:
+      - "$geoip_cn"
+  - tag: match_qname
+    type: qname
+    args:
+      - "$geosite_cn"
+  - tag: match_question
+    type: question
+    args:
+      - "$geosite_foreign"
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    assert!(registry.get_plugin("geoip_cn").is_some());
+    assert!(registry.get_plugin("geosite_cn").is_some());
+    assert!(registry.get_plugin("geosite_foreign").is_some());
+
+    let client_matcher = registry
+        .get_plugin("match_client")
+        .expect("client matcher should exist")
+        .to_matcher();
+    let qname_matcher = registry
+        .get_plugin("match_qname")
+        .expect("qname matcher should exist")
+        .to_matcher();
+    let question_matcher = registry
+        .get_plugin("match_question")
+        .expect("question matcher should exist")
+        .to_matcher();
+
+    let mut cn_ctx = make_context(registry.clone(), "265.com.");
+    cn_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(1, 0, 1, 1), 5300)));
+    assert!(client_matcher.is_match(&mut cn_ctx));
+    assert!(qname_matcher.is_match(&mut cn_ctx));
+
+    let mut foreign_ctx = make_context(registry.clone(), "a.ppy.sh.");
+    assert!(question_matcher.is_match(&mut foreign_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "provider-protobuf")]
+#[tokio::test]
+async fn test_set_providers_can_compose_geo_providers() -> Result<()> {
+    let geoip_dat = test_rule_path("geoip.dat");
+    let geosite_dat = test_rule_path("geosite.dat");
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: geoip_cn
+    type: geoip
+    args:
+      file: "{geoip_dat}"
+      selectors: ["cn"]
+  - tag: geosite_cn
+    type: geosite
+    args:
+      file: "{geosite_dat}"
+      selectors: ["cn"]
+  - tag: mixed_ip
+    type: ip_set
+    args:
+      ips:
+        - "198.51.100.0/24"
+      sets:
+        - "geoip_cn"
+  - tag: mixed_domain
+    type: domain_set
+    args:
+      exps:
+        - "full:custom.example"
+      sets:
+        - "geosite_cn"
+  - tag: match_client
+    type: client_ip
+    args:
+      - "$mixed_ip"
+  - tag: match_qname
+    type: qname
+    args:
+      - "$mixed_domain"
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+
+    let ip_matcher = registry
+        .get_plugin("match_client")
+        .expect("client matcher should exist")
+        .to_matcher();
+    let domain_matcher = registry
+        .get_plugin("match_qname")
+        .expect("qname matcher should exist")
+        .to_matcher();
+
+    let mut geo_ctx = make_context(registry.clone(), "example.com.");
+    geo_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(1, 0, 1, 1), 5300)));
+    assert!(ip_matcher.is_match(&mut geo_ctx));
+
+    let mut inline_ip_ctx = make_context(registry.clone(), "example.com.");
+    inline_ip_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(198, 51, 100, 7), 5300)));
+    assert!(ip_matcher.is_match(&mut inline_ip_ctx));
+
+    let mut geo_domain_ctx = make_context(registry.clone(), "265.com.");
+    assert!(domain_matcher.is_match(&mut geo_domain_ctx));
+
+    let mut inline_domain_ctx = make_context(registry.clone(), "custom.example.");
+    assert!(domain_matcher.is_match(&mut inline_domain_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_reload_provider_registry_refreshes_file_backed_domain_provider_without_full_reload()
+-> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let shared_file = temp_dir.path().join("shared-domain.txt");
+    std::fs::write(&shared_file, "old.example\n")?;
+
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: shared_domain
+    type: domain_set
+    args:
+      files:
+        - "{}"
+  - tag: combined_domain
+    type: domain_set
+    args:
+      exps:
+        - "full:static.example"
+      sets:
+        - "shared_domain"
+  - tag: match_qname
+    type: qname
+    args:
+      - "$combined_domain"
+"#,
+        yaml_path(&shared_file)
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let matcher = registry
+        .get_plugin("match_qname")
+        .expect("qname matcher should exist")
+        .to_matcher();
+
+    let mut old_ctx = make_context(registry.clone(), "old.example.");
+    assert!(matcher.is_match(&mut old_ctx));
+    let mut static_ctx = make_context(registry.clone(), "static.example.");
+    assert!(matcher.is_match(&mut static_ctx));
+    let mut new_ctx = make_context(registry.clone(), "new.example.");
+    assert!(!matcher.is_match(&mut new_ctx));
+
+    std::fs::write(&shared_file, "new.example\n")?;
+    registry.reload_provider("shared_domain").await?;
+
+    let mut old_ctx = make_context(registry.clone(), "old.example.");
+    assert!(!matcher.is_match(&mut old_ctx));
+    let mut static_ctx = make_context(registry.clone(), "static.example.");
+    assert!(matcher.is_match(&mut static_ctx));
+    let mut new_ctx = make_context(registry.clone(), "new.example.");
+    assert!(matcher.is_match(&mut new_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_reload_provider_registry_refreshes_file_backed_ip_provider_without_full_reload()
+-> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let shared_file = temp_dir.path().join("shared-ip.txt");
+    std::fs::write(&shared_file, "203.0.113.7\n")?;
+
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: shared_ip
+    type: ip_set
+    args:
+      files:
+        - "{}"
+  - tag: combined_ip
+    type: ip_set
+    args:
+      ips:
+        - "198.51.100.0/24"
+      sets:
+        - "shared_ip"
+  - tag: match_client
+    type: client_ip
+    args:
+      - "$combined_ip"
+"#,
+        yaml_path(&shared_file)
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let matcher = registry
+        .get_plugin("match_client")
+        .expect("client matcher should exist")
+        .to_matcher();
+
+    let mut old_ctx = make_context(registry.clone(), "example.com.");
+    old_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 5300)));
+    assert!(matcher.is_match(&mut old_ctx));
+    let mut static_ctx = make_context(registry.clone(), "example.com.");
+    static_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(198, 51, 100, 7), 5300)));
+    assert!(matcher.is_match(&mut static_ctx));
+    let mut new_ctx = make_context(registry.clone(), "example.com.");
+    new_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(203, 0, 113, 8), 5300)));
+    assert!(!matcher.is_match(&mut new_ctx));
+
+    std::fs::write(&shared_file, "203.0.113.8\n")?;
+    registry.reload_provider("shared_ip").await?;
+
+    let mut old_ctx = make_context(registry.clone(), "example.com.");
+    old_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 5300)));
+    assert!(!matcher.is_match(&mut old_ctx));
+    let mut static_ctx = make_context(registry.clone(), "example.com.");
+    static_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(198, 51, 100, 7), 5300)));
+    assert!(matcher.is_match(&mut static_ctx));
+    let mut new_ctx = make_context(registry.clone(), "example.com.");
+    new_ctx.set_peer_addr(SocketAddr::from((Ipv4Addr::new(203, 0, 113, 8), 5300)));
+    assert!(matcher.is_match(&mut new_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_reload_provider_executor_refreshes_domain_provider() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let shared_file = temp_dir.path().join("reload-domain.txt");
+    std::fs::write(&shared_file, "old.example\n")?;
+
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: shared_domain
+    type: domain_set
+    args:
+      files:
+        - "{}"
+  - tag: refresh_domain
+    type: reload_provider
+    args:
+      - "$shared_domain"
+  - tag: match_qname
+    type: qname
+    args:
+      - "$shared_domain"
+"#,
+        yaml_path(&shared_file)
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let matcher = registry
+        .get_plugin("match_qname")
+        .expect("qname matcher should exist")
+        .to_matcher();
+    let executor = registry
+        .get_plugin("refresh_domain")
+        .expect("reload_provider executor should exist")
+        .to_executor();
+
+    let mut old_ctx = make_context(registry.clone(), "old.example.");
+    assert!(matcher.is_match(&mut old_ctx));
+    let mut new_ctx = make_context(registry.clone(), "new.example.");
+    assert!(!matcher.is_match(&mut new_ctx));
+
+    std::fs::write(&shared_file, "new.example\n")?;
+    let mut trigger_ctx = make_context(registry.clone(), "trigger.example.");
+    assert!(matches!(
+        executor.execute(&mut trigger_ctx).await?,
+        ExecStep::Next
+    ));
+
+    let mut old_ctx = make_context(registry.clone(), "old.example.");
+    assert!(!matcher.is_match(&mut old_ctx));
+    let mut new_ctx = make_context(registry.clone(), "new.example.");
+    assert!(matcher.is_match(&mut new_ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "provider-protobuf")]
+#[tokio::test]
+async fn test_geo_provider_failure_paths_are_reported() -> Result<()> {
+    let geoip_dat = test_rule_path("geoip.dat");
+    let geosite_dat = test_rule_path("geosite.dat");
+
+    let missing_code_yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: geoip_missing
+    type: geoip
+    args:
+      file: "{geoip_dat}"
+      selectors: ["not-found-code"]
+  - tag: match_client
+    type: client_ip
+    args:
+      - "$geoip_missing"
+"#
+    );
+    let err = plugin::init(parse_config(&missing_code_yaml)?)
+        .await
+        .expect_err("missing geoip code should fail");
+    assert!(err.to_string().contains("found no geoip entries"));
+
+    let wrong_set_yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: geosite_cn
+    type: geosite
+    args:
+      file: "{geosite_dat}"
+      selectors: ["cn"]
+  - tag: invalid_ip_set
+    type: ip_set
+    args:
+      sets:
+        - "geosite_cn"
+  - tag: match_client
+    type: client_ip
+    args:
+      - "$invalid_ip_set"
+"#
+    );
+    let err = plugin::init(parse_config(&wrong_set_yaml)?)
+        .await
+        .expect_err("ip_set should reject non-ip provider");
+    assert!(err.to_string().contains("support IP matching"));
+
+    let wrong_matcher_yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: geoip_cn
+    type: geoip
+    args:
+      file: "{geoip_dat}"
+      selectors: ["cn"]
+  - tag: invalid_qname
+    type: qname
+    args:
+      - "$geoip_cn"
+"#
+    );
+    let err = plugin::init(parse_config(&wrong_matcher_yaml)?)
+        .await
+        .expect_err("qname should reject non-domain provider");
+    assert!(err.to_string().contains("support domain matching"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plugin_system_init_reports_dependency_kind_mismatch() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: debug
+    type: debug_print
+  - tag: seq
+    type: sequence
+    args:
+      - matches:
+          - $debug
+        exec: reject 2
+"#;
+
+    let config = parse_config(yaml)?;
+    let err = plugin::init(config)
+        .await
+        .expect_err("kind mismatch should fail plugin init");
+    let msg = err.to_string();
+
+    assert!(msg.contains("plugin 'seq'"));
+    assert!(msg.contains("args[0].matches[0]"));
+    assert!(msg.contains("expects matcher plugin"));
+    assert!(msg.contains("'debug' is executor"));
+    Ok(())
+}
+
+#[cfg(feature = "provider-adguard-rule")]
+#[tokio::test]
+async fn test_adguard_rule_provider_drives_question_matcher_branch() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: agh_rules
+    type: adguard_rule
+    args:
+      rules:
+        - "||ads.example.com^"
+        - "@@||safe.ads.example.com^"
+        - "||rewrite.example.com^$dnsrewrite=1.2.3.4"
+  - tag: agh_match
+    type: question
+    args:
+      - "$agh_rules"
+  - tag: blocked
+    type: sequence
+    args:
+      - exec: "black_hole 0.0.0.0 ::"
+      - exec: accept
+  - tag: main
+    type: sequence
+    args:
+      - matches: $agh_match
+        exec: goto blocked
+      - exec: reject 2
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let main = registry
+        .get_plugin("main")
+        .expect("main sequence should exist")
+        .to_executor();
+
+    let mut blocked_ctx = make_context(registry.clone(), "ads.example.com.");
+    let blocked_step = main.execute(&mut blocked_ctx).await?;
+    assert!(matches!(blocked_step, ExecStep::Stop));
+    let blocked_response = blocked_ctx
+        .response()
+        .expect("blocked query should synthesize a response");
+    assert_eq!(blocked_response.rcode(), Rcode::NoError);
+    assert_eq!(blocked_response.answers().len(), 1);
+    assert_eq!(blocked_response.answers()[0].rr_type(), RecordType::A);
+
+    let mut allow_ctx = make_context(registry.clone(), "safe.ads.example.com.");
+    let allow_step = main.execute(&mut allow_ctx).await?;
+    assert!(matches!(allow_step, ExecStep::Stop));
+    assert_eq!(
+        allow_ctx
+            .response()
+            .expect("fallback reject should build response")
+            .rcode(),
+        Rcode::ServFail
+    );
+
+    let mut unsupported_ctx = make_context(registry.clone(), "rewrite.example.com.");
+    let unsupported_step = main.execute(&mut unsupported_ctx).await?;
+    assert!(matches!(unsupported_step, ExecStep::Stop));
+    assert_eq!(
+        unsupported_ctx
+            .response()
+            .expect("unsupported dnsrewrite rule should be skipped")
+            .rcode(),
+        Rcode::ServFail
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "provider-adguard-rule")]
+#[tokio::test]
+async fn test_adguard_rule_provider_drives_qname_matcher_branch() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: agh_rules
+    type: adguard_rule
+    args:
+      rules:
+        - "||ads.example.com^"
+        - "@@||safe.ads.example.com^"
+        - "||type-only.example.com^$dnstype=AAAA"
+  - tag: agh_match
+    type: qname
+    args:
+      - "$agh_rules"
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let matcher = registry
+        .get_plugin("agh_match")
+        .expect("qname matcher should exist")
+        .to_matcher();
+
+    let mut blocked_ctx = make_context(registry.clone(), "ads.example.com.");
+    assert!(matcher.is_match(&mut blocked_ctx));
+
+    let mut allow_ctx = make_context(registry.clone(), "safe.ads.example.com.");
+    assert!(!matcher.is_match(&mut allow_ctx));
+
+    let mut dnstype_only_ctx = make_context(registry.clone(), "type-only.example.com.");
+    assert!(
+        !matcher.is_match(&mut dnstype_only_ctx),
+        "qname should use name-only projection and ignore dnstype-only rules"
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "provider-adguard-rule")]
+#[tokio::test]
+async fn test_adguard_rule_provider_loads_rules_from_file() -> Result<()> {
+    let adguard_rules = test_rule_path("adguard_rule_1.txt");
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: agh_rules
+    type: adguard_rule
+    args:
+      files:
+        - "{adguard_rules}"
+  - tag: agh_match
+    type: question
+    args:
+      - "$agh_rules"
+  - tag: blocked
+    type: sequence
+    args:
+      - exec: "black_hole 0.0.0.0"
+      - exec: accept
+  - tag: main
+    type: sequence
+    args:
+      - matches: $agh_match
+        exec: goto blocked
+      - exec: reject 2
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let agh_rules = registry
+        .get_plugin("agh_rules")
+        .expect("agh_rules provider should exist")
+        .to_provider();
+    let main = registry
+        .get_plugin("main")
+        .expect("main sequence should exist")
+        .to_executor();
+
+    let assert_blocked = |label: &str, ctx: &DnsContext| {
+        let response = ctx
+            .response()
+            .unwrap_or_else(|| panic!("{label} should synthesize a blocked response"));
+        assert_eq!(response.rcode(), Rcode::NoError);
+        assert_eq!(response.answers().len(), 1);
+        assert_eq!(
+            response.answers()[0].rr_type(),
+            ctx.request
+                .first_question()
+                .expect("request should contain one question")
+                .qtype()
+        );
+    };
+
+    let assert_rejected = |label: &str, ctx: &DnsContext| {
+        assert_eq!(
+            ctx.response()
+                .unwrap_or_else(|| panic!("{label} should fall through to reject"))
+                .rcode(),
+            Rcode::ServFail
+        );
+    };
+
+    let mut plain_exact = make_context(registry.clone(), "plain-match.example.");
+    assert!(matches!(
+        main.execute(&mut plain_exact).await?,
+        ExecStep::Stop
+    ));
+    assert_blocked("plain_exact", &plain_exact);
+
+    let mut plain_subdomain = make_context(registry.clone(), "www.plain-match.example.");
+    assert!(matches!(
+        main.execute(&mut plain_subdomain).await?,
+        ExecStep::Stop
+    ));
+    assert_rejected("plain_subdomain", &plain_subdomain);
+
+    let mut suffix = make_context(registry.clone(), "cdn.suffix.example.");
+    assert!(matches!(main.execute(&mut suffix).await?, ExecStep::Stop));
+    assert_blocked("suffix", &suffix);
+
+    let mut exception = make_context(registry.clone(), "allow.suffix.example.");
+    assert!(matches!(
+        main.execute(&mut exception).await?,
+        ExecStep::Stop
+    ));
+    assert_rejected("exception", &exception);
+
+    let mut wildcard = make_context(registry.clone(), "ad-banner.wild.example.");
+    assert!(matches!(main.execute(&mut wildcard).await?, ExecStep::Stop));
+    assert_blocked("wildcard", &wildcard);
+
+    let mut regex = make_context(registry.clone(), "metrics12.service.test.");
+    assert!(matches!(main.execute(&mut regex).await?, ExecStep::Stop));
+    assert_blocked("regex", &regex);
+
+    let mut denyallow_root = make_context(registry.clone(), "deny.example.");
+    assert!(matches!(
+        main.execute(&mut denyallow_root).await?,
+        ExecStep::Stop
+    ));
+    assert_blocked("denyallow_root", &denyallow_root);
+
+    let mut denyallow_sub = make_context(registry.clone(), "sub.deny.example.");
+    assert!(matches!(
+        main.execute(&mut denyallow_sub).await?,
+        ExecStep::Stop
+    ));
+    assert_rejected("denyallow_sub", &denyallow_sub);
+
+    let dnstype_aaaa =
+        make_context_with_qtype(registry.clone(), "ipv6-only.example.", RecordType::AAAA);
+    assert!(
+        agh_rules.contains_question(
+            dnstype_aaaa
+                .request()
+                .first_question()
+                .expect("question should exist")
+        )
+    );
+
+    let dnstype_a = make_context_with_qtype(registry.clone(), "ipv6-only.example.", RecordType::A);
+    assert!(
+        !agh_rules.contains_question(
+            dnstype_a
+                .request()
+                .first_question()
+                .expect("question should exist")
+        )
+    );
+
+    assert!(agh_rules.contains_name(&Name::from_ascii("plain-match.example.").unwrap()));
+    assert!(!agh_rules.contains_name(&Name::from_ascii("ipv6-only.example.").unwrap()));
+
+    let mut important_exception = make_context(registry.clone(), "important.example.");
+    assert!(matches!(
+        main.execute(&mut important_exception).await?,
+        ExecStep::Stop
+    ));
+    assert_rejected("important_exception", &important_exception);
+
+    let mut badfilter_disabled = make_context(registry.clone(), "disabled.example.");
+    assert!(matches!(
+        main.execute(&mut badfilter_disabled).await?,
+        ExecStep::Stop
+    ));
+    assert_rejected("badfilter_disabled", &badfilter_disabled);
+
+    let mut unsupported_modifier = make_context(registry.clone(), "rewrite.example.");
+    assert!(matches!(
+        main.execute(&mut unsupported_modifier).await?,
+        ExecStep::Stop
+    ));
+    assert_rejected("unsupported_modifier", &unsupported_modifier);
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_question_matcher_matches_when_any_question_matches() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: domain_rules
+    type: domain_set
+    args:
+      exps:
+        - full:second.example
+  - tag: q_match
+    type: question
+    args:
+      - "$domain_rules"
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    let matcher = registry
+        .get_plugin("q_match")
+        .expect("question matcher should exist")
+        .to_matcher();
+
+    let mut request = Message::new();
+    request.add_question(Question::new(
+        Name::from_ascii("first.example.").unwrap(),
+        RecordType::A,
+        DNSClass::IN,
+    ));
+    request.add_question(Question::new(
+        Name::from_ascii("second.example.").unwrap(),
+        RecordType::AAAA,
+        DNSClass::IN,
+    ));
+    let mut ctx = DnsContext::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 5300)), request);
+
+    assert!(matcher.is_match(&mut ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plugin_system_init_reports_circular_sequence_dependencies() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: seq_a
+    type: sequence
+    args:
+      - exec: jump seq_b
+  - tag: seq_b
+    type: sequence
+    args:
+      - exec: jump seq_a
+"#;
+
+    let config = parse_config(yaml)?;
+    let err = plugin::init(config)
+        .await
+        .expect_err("circular dependencies should fail plugin init");
+    let msg = err.to_string();
+
+    assert!(msg.contains("Circular dependency detected"));
+    assert!(msg.contains("seq_a"));
+    assert!(msg.contains("seq_b"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plugin_system_init_rejects_dollar_prefixed_jump_target() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: seq_a
+    type: sequence
+    args:
+      - exec: jump $seq_b
+  - tag: seq_b
+    type: sequence
+"#;
+
+    let config = parse_config(yaml)?;
+    let err = plugin::init(config)
+        .await
+        .expect_err("dollar-prefixed jump target should fail plugin init");
+    let msg = err.to_string();
+
+    assert!(msg.contains("jump target must be sequence tag without '$' prefix"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_plugin_system_init_reports_jump_target_must_be_sequence() -> Result<()> {
+    let yaml = r#"
+log:
+  level: info
+plugins:
+  - tag: debug
+    type: debug_print
+  - tag: seq
+    type: sequence
+    args:
+      - exec: jump debug
+"#;
+
+    let config = parse_config(yaml)?;
+    let err = plugin::init(config)
+        .await
+        .expect_err("jump target should require sequence plugin");
+    let msg = err.to_string();
+
+    assert!(msg.contains("plugin 'seq'"));
+    assert!(msg.contains("args[0].exec"));
+    assert!(
+        msg.contains("plugin type 'sequence'") || msg.contains("executor plugin type 'sequence'")
+    );
+    assert!(msg.contains("'debug'"));
+    assert!(msg.contains("debug_print"));
+    Ok(())
+}
+
+#[cfg(feature = "plugin-cron")]
+#[tokio::test]
+async fn test_cron_plugin_init_accepts_interval_and_quick_setup_executor() -> Result<()> {
+    let yaml = r#"
+plugins:
+  - tag: child
+    type: sequence
+    args:
+      - exec: accept
+  - tag: cron_main
+    type: cron
+    args:
+      jobs:
+        - name: refresh
+          interval: 1m
+          executors:
+            - "$child"
+            - "debug_print cron interval"
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    assert_eq!(
+        registry
+            .get_plugin("cron_main")
+            .expect("cron plugin should exist")
+            .plugin_name,
+        "cron"
+    );
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-cron")]
+#[tokio::test]
+async fn test_cron_plugin_init_accepts_schedule_job() -> Result<()> {
+    let yaml = r#"
+plugins:
+  - tag: child
+    type: sequence
+    args:
+      - exec: accept
+  - tag: cron_main
+    type: cron
+    args:
+      timezone: "UTC"
+      jobs:
+        - name: cleanup
+          schedule: "0 */6 * * *"
+          executors:
+            - "$child"
+"#;
+
+    let config = parse_config(yaml)?;
+    let registry = plugin::init(config).await?;
+    assert_eq!(
+        registry
+            .get_plugin("cron_main")
+            .expect("cron plugin should exist")
+            .plugin_name,
+        "cron"
+    );
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-cron")]
+#[tokio::test]
+async fn test_cron_plugin_init_rejects_invalid_timezone() -> Result<()> {
+    let yaml = r#"
+plugins:
+  - tag: child
+    type: sequence
+    args:
+      - exec: accept
+  - tag: cron_main
+    type: cron
+    args:
+      timezone: "Mars/Base"
+      jobs:
+        - name: cleanup
+          schedule: "0 */6 * * *"
+          executors:
+            - "$child"
+"#;
+
+    let err = plugin::init(parse_config(yaml)?)
+        .await
+        .expect_err("invalid timezone should be rejected");
+    assert!(err.to_string().contains("failed to parse cron schedule"));
+    Ok(())
+}
+
+#[cfg(feature = "plugin-cron")]
+#[tokio::test]
+async fn test_cron_plugin_init_rejects_second_level_schedule() -> Result<()> {
+    let yaml = r#"
+plugins:
+  - tag: child
+    type: sequence
+    args:
+      - exec: accept
+  - tag: cron_main
+    type: cron
+    args:
+      jobs:
+        - name: bad
+          schedule: "0 0 * * * *"
+          executors:
+            - "$child"
+"#;
+
+    let err = plugin::init(parse_config(yaml)?)
+        .await
+        .expect_err("6-field cron should be rejected");
+    assert!(err.to_string().contains("second-level cron"));
+    Ok(())
+}
+
+#[cfg(feature = "plugin-cron")]
+#[tokio::test]
+async fn test_cron_plugin_init_rejects_second_level_interval() -> Result<()> {
+    let yaml = r#"
+plugins:
+  - tag: child
+    type: sequence
+    args:
+      - exec: accept
+  - tag: cron_main
+    type: cron
+    args:
+      jobs:
+        - name: bad
+          interval: 30s
+          executors:
+            - "$child"
+"#;
+
+    let err = plugin::init(parse_config(yaml)?)
+        .await
+        .expect_err("sub-minute interval should be rejected");
+    assert!(err.to_string().contains("at least 1 minute"));
+    Ok(())
+}
+
+#[cfg(feature = "plugin-cron")]
+#[tokio::test]
+async fn test_cron_plugin_init_rejects_cron_dependency() -> Result<()> {
+    let yaml = r#"
+plugins:
+  - tag: child_cron
+    type: cron
+    args:
+      jobs:
+        - name: child
+          interval: 1m
+          executors:
+            - "debug_print child"
+  - tag: parent_cron
+    type: cron
+    args:
+      jobs:
+        - name: parent
+          interval: 1m
+          executors:
+            - "$child_cron"
+"#;
+
+    let err = plugin::init(parse_config(yaml)?)
+        .await
+        .expect_err("cron should not reference another cron");
+    let msg = err.to_string();
+    assert!(msg.contains("cannot reference cron executor"));
+    Ok(())
+}
+
+#[cfg(feature = "plugin-download")]
+#[tokio::test]
+async fn test_download_executor_continues_after_item_failure() -> Result<()> {
+    let server_addr = start_test_http_server(vec![
+        ("/ok.txt", StatusCode::OK, "download-ok"),
+        ("/missing.txt", StatusCode::NOT_FOUND, "missing"),
+    ])
+    .await?;
+    let tmp_dir = TempDir::new().expect("temp dir should be created");
+    let output_dir = tmp_dir.path().join("rules");
+    let output_dir_yaml = yaml_path(&output_dir);
+
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: dl
+    type: download
+    args:
+      startup_if_missing: false
+      downloads:
+        - url: "http://{server_addr}/missing.txt"
+          dir: "{output_dir_yaml}"
+          filename: "missing.txt"
+        - url: "http://{server_addr}/ok.txt"
+          dir: "{output_dir_yaml}"
+          filename: "ok.txt"
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("dl")
+        .expect("download plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = executor.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    assert!(!output_dir.join("missing.txt").exists());
+    assert_eq!(
+        tokio::fs::read_to_string(output_dir.join("ok.txt")).await?,
+        "download-ok"
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-download")]
+#[tokio::test]
+async fn test_download_executor_supports_socks5_proxy() -> Result<()> {
+    let server_addr =
+        start_test_http_server(vec![("/proxied.txt", StatusCode::OK, "proxied-download")]).await?;
+    let socks5_addr = start_test_socks5_proxy().await?;
+    let tmp_dir = TempDir::new().expect("temp dir should be created");
+    let output_dir = tmp_dir.path().join("proxied");
+    let output_dir_yaml = yaml_path(&output_dir);
+
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: dl
+    type: download
+    args:
+      socks5: "{socks5_addr}"
+      downloads:
+        - url: "http://{server_addr}/proxied.txt"
+          dir: "{output_dir_yaml}"
+          filename: "proxied.txt"
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("dl")
+        .expect("download plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = executor.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(
+        tokio::fs::read_to_string(output_dir.join("proxied.txt")).await?,
+        "proxied-download"
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-download")]
+#[tokio::test]
+async fn test_download_executor_startup_if_missing_bootstraps_files_before_provider_init()
+-> Result<()> {
+    let geosite_dat = tokio::fs::read(test_rule_path("geosite.dat")).await?;
+    let server_addr = start_test_http_server_routes(vec![
+        TestHttpRoute {
+            path: "/geosite.dat".to_string(),
+            status: StatusCode::FOUND,
+            body: Vec::new(),
+            location: Some("/assets/geosite.dat".to_string()),
+            response_delay: None,
+        },
+        TestHttpRoute::new(
+            "/assets/geosite.dat".to_string(),
+            StatusCode::OK,
+            geosite_dat,
+        ),
+    ])
+    .await?;
+    let tmp_dir = TempDir::new().expect("temp dir should be created");
+    let dat_dir = tmp_dir.path().join("rules");
+    let dat_dir_yaml = yaml_path(&dat_dir);
+    let dat_file = dat_dir.join("geosite.dat");
+    let dat_file_yaml = yaml_path(&dat_file);
+
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: bootstrap_download
+    type: download
+    args:
+      downloads:
+        - url: "http://{server_addr}/geosite.dat"
+          dir: "{dat_dir_yaml}"
+          filename: "geosite.dat"
+  - tag: geosite_cn
+    type: geosite
+    args:
+      file: "{dat_file_yaml}"
+      selectors:
+        - "cn"
+  - tag: match_qname
+    type: qname
+    args:
+      - "$geosite_cn"
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let matcher = registry
+        .get_plugin("match_qname")
+        .expect("qname matcher should exist")
+        .to_matcher();
+
+    assert!(dat_file.exists());
+    let mut ctx = make_context(registry.clone(), "265.com.");
+    assert!(matcher.is_match(&mut ctx));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-download")]
+#[tokio::test]
+async fn test_sequence_download_quick_setup_executes_and_overwrites_target() -> Result<()> {
+    let server_addr =
+        start_test_http_server(vec![("/quick.txt", StatusCode::OK, "quick-setup")]).await?;
+    let tmp_dir = TempDir::new().expect("temp dir should be created");
+    let output_dir = tmp_dir.path().join("download");
+    let output_dir_yaml = yaml_path(&output_dir);
+
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: seq
+    type: sequence
+    args:
+      - exec: "download http://{server_addr}/quick.txt {output_dir_yaml}"
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let sequence = registry
+        .get_plugin("seq")
+        .expect("sequence plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = sequence.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    assert_eq!(
+        tokio::fs::read_to_string(output_dir.join("quick.txt")).await?,
+        "quick-setup"
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-script")]
+#[tokio::test]
+async fn test_script_executor_injects_context_into_args_and_env() -> Result<()> {
+    let tmp_dir = TempDir::new().expect("temp dir should be created");
+    #[cfg(unix)]
+    let script_path = tmp_dir.path().join("capture.sh");
+    #[cfg(windows)]
+    let script_path = tmp_dir.path().join("capture.cmd");
+    let output_path = tmp_dir.path().join("script_output.txt");
+    write_capture_script(&script_path, &output_path)?;
+    let (command, command_args) = platform_script_command(&script_path);
+    let command_args_yaml = command_args
+        .iter()
+        .map(|arg| format!("        - \"{}\"\n", arg))
+        .collect::<String>();
+
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: script_main
+    type: script
+    args:
+      command: "{command}"
+      args:
+{command_args_yaml}        - "qname=${{qname}}"
+        - "client=${{client_ip}}"
+      env:
+        FDNS_QNAME: "${{qname}}"
+        FDNS_CLIENT_IP: "${{client_ip}}"
+        FDNS_SERVER_NAME: "${{server_name}}"
+        FDNS_URL_PATH: "${{url_path}}"
+        FDNS_MARKS: "${{marks}}"
+        FDNS_HAS_RESP: "${{has_resp}}"
+        FDNS_RCODE: "${{rcode_name}}"
+        FDNS_RESP_IP: "${{resp_ip}}"
+        FDNS_CRON_JOB: "${{cron_job_name}}"
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("script_main")
+        .expect("script plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+    context.set_request_meta(RequestMeta {
+        server_name: Some(StdArc::from("dns.example.com")),
+        url_path: Some(StdArc::from("/dns-query")),
+    });
+    context.marks_mut().insert(2);
+    context.marks_mut().insert(1);
+    context.set_attr("cron.job_name", "nightly".to_string());
+    let mut response = context.request().response(Rcode::NoError);
+    response.add_answer(oxidns::proto::Record::from_rdata(
+        Name::from_ascii("example.com.").unwrap(),
+        60,
+        oxidns::proto::RData::A(oxidns::proto::rdata::A(Ipv4Addr::new(192, 0, 2, 1))),
+    ));
+    context.set_response(response);
+
+    let step = executor.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    let output = tokio::fs::read_to_string(&output_path).await?;
+    assert!(output.contains("ARGS=qname=example.com client=127.0.0.1"));
+    assert!(output.contains("QNAME=example.com"));
+    assert!(output.contains("CLIENT=127.0.0.1"));
+    assert!(output.contains("SERVER=dns.example.com"));
+    assert!(output.contains("URL=/dns-query"));
+    assert!(output.contains("MARKS=1,2"));
+    assert!(output.contains("HAS_RESP=true"));
+    assert!(output.contains("RCODE=NoError"));
+    assert!(output.contains("RESP_IP=192.0.2.1"));
+    assert!(output.contains("CRON_JOB=nightly"));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-script")]
+#[tokio::test]
+async fn test_script_executor_timeout_continue_returns_next() -> Result<()> {
+    let tmp_dir = TempDir::new().expect("temp dir should be created");
+    #[cfg(unix)]
+    let script_path = tmp_dir.path().join("timeout.sh");
+    #[cfg(windows)]
+    let script_path = tmp_dir.path().join("timeout.cmd");
+    write_timeout_script(&script_path)?;
+    let (command, command_args) = platform_script_command(&script_path);
+    let command_args_yaml = command_args
+        .iter()
+        .map(|arg| format!("        - \"{}\"\n", arg))
+        .collect::<String>();
+
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: script_main
+    type: script
+    args:
+      command: "{command}"
+      args:
+{command_args_yaml}      timeout: "100ms"
+      error_mode: continue
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("script_main")
+        .expect("script plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = executor.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-script")]
+#[tokio::test]
+async fn test_script_executor_failure_stop_returns_stop() -> Result<()> {
+    let tmp_dir = TempDir::new().expect("temp dir should be created");
+    #[cfg(unix)]
+    let script_path = tmp_dir.path().join("fail_stop.sh");
+    #[cfg(windows)]
+    let script_path = tmp_dir.path().join("fail_stop.cmd");
+    write_failure_script(&script_path, 7)?;
+    let (command, command_args) = platform_script_command(&script_path);
+    let command_args_yaml = command_args
+        .iter()
+        .map(|arg| format!("        - \"{}\"\n", arg))
+        .collect::<String>();
+
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: script_main
+    type: script
+    args:
+      command: "{command}"
+      args:
+{command_args_yaml}      error_mode: stop
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("script_main")
+        .expect("script plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = executor.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Stop));
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-script")]
+#[tokio::test]
+async fn test_script_executor_failure_fail_returns_error() -> Result<()> {
+    let tmp_dir = TempDir::new().expect("temp dir should be created");
+    #[cfg(unix)]
+    let script_path = tmp_dir.path().join("fail_err.sh");
+    #[cfg(windows)]
+    let script_path = tmp_dir.path().join("fail_err.cmd");
+    write_failure_script(&script_path, 9)?;
+    let (command, command_args) = platform_script_command(&script_path);
+    let command_args_yaml = command_args
+        .iter()
+        .map(|arg| format!("        - \"{}\"\n", arg))
+        .collect::<String>();
+
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: script_main
+    type: script
+    args:
+      command: "{command}"
+      args:
+{command_args_yaml}      error_mode: fail
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("script_main")
+        .expect("script plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let err = executor
+        .execute(&mut context)
+        .await
+        .expect_err("fail mode should return error");
+
+    assert!(err.to_string().contains("script plugin"));
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-http-request")]
+#[tokio::test]
+async fn test_http_request_executor_sync_before_get_sends_headers_and_query_params() -> Result<()> {
+    let (server_addr, mut rx) = start_recording_http_server_routes(vec![TestHttpRoute::new(
+        "/hook".to_string(),
+        StatusCode::OK,
+        b"ok".to_vec(),
+    )])
+    .await?;
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: http_main
+    type: http_request
+    args:
+      method: GET
+      url: "http://{server_addr}/hook"
+      phase: before
+      async: false
+      headers:
+        X-Qname: "${{qname}}"
+      query_params:
+        client: "${{client_ip}}"
+        name: "${{qname}}"
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("http_main")
+        .expect("http_request plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = executor.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    let captured = wait_for_captured_request(&mut rx).await?;
+    assert_eq!(captured.method, "GET");
+    assert_eq!(captured.path, "/hook");
+    assert_eq!(captured.header("x-qname"), Some("example.com"));
+    assert!(
+        captured
+            .query
+            .as_deref()
+            .unwrap_or_default()
+            .contains("client=127.0.0.1")
+    );
+    assert!(
+        captured
+            .query
+            .as_deref()
+            .unwrap_or_default()
+            .contains("name=example.com")
+    );
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-http-request")]
+#[tokio::test]
+async fn test_http_request_executor_sync_after_post_json_uses_response_placeholders() -> Result<()>
+{
+    let (server_addr, mut rx) = start_recording_http_server_routes(vec![TestHttpRoute::new(
+        "/notify".to_string(),
+        StatusCode::OK,
+        b"ok".to_vec(),
+    )])
+    .await?;
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: http_main
+    type: http_request
+    args:
+      method: POST
+      url: "http://{server_addr}/notify"
+      phase: after
+      async: false
+      json:
+        qname: "${{qname}}"
+        rcode: "${{rcode_name}}"
+        resp_ip: "${{resp_ip}}"
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("http_main")
+        .expect("http_request plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+    let mut response = context.request().response(Rcode::NoError);
+    response.add_answer(oxidns::proto::Record::from_rdata(
+        Name::from_ascii("example.com.").unwrap(),
+        60,
+        oxidns::proto::RData::A(oxidns::proto::rdata::A(Ipv4Addr::new(192, 0, 2, 1))),
+    ));
+    context.set_response(response);
+
+    let step = executor.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    let captured = wait_for_captured_request(&mut rx).await?;
+    let body: serde_json::Value = serde_json::from_slice(&captured.body)
+        .map_err(|e| DnsError::runtime(format!("invalid json body: {e}")))?;
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.header("content-type"), Some("application/json"));
+    assert_eq!(body["qname"], "example.com");
+    assert_eq!(body["rcode"], "NoError");
+    assert_eq!(body["resp_ip"], "192.0.2.1");
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-http-request")]
+#[tokio::test]
+async fn test_http_request_executor_supports_raw_body_and_content_type() -> Result<()> {
+    let (server_addr, mut rx) = start_recording_http_server_routes(vec![TestHttpRoute::new(
+        "/raw".to_string(),
+        StatusCode::OK,
+        b"ok".to_vec(),
+    )])
+    .await?;
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: http_main
+    type: http_request
+    args:
+      method: POST
+      url: "http://{server_addr}/raw"
+      async: false
+      body: "q=${{qname}}&client=${{client_ip}}"
+      content_type: "text/plain"
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("http_main")
+        .expect("http_request plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = executor.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    let captured = wait_for_captured_request(&mut rx).await?;
+    assert_eq!(captured.header("content-type"), Some("text/plain"));
+    assert_eq!(captured.body_text(), "q=example.com&client=127.0.0.1");
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-http-request")]
+#[tokio::test]
+async fn test_http_request_executor_supports_form_body_encoding() -> Result<()> {
+    let (server_addr, mut rx) = start_recording_http_server_routes(vec![TestHttpRoute::new(
+        "/form".to_string(),
+        StatusCode::OK,
+        b"ok".to_vec(),
+    )])
+    .await?;
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: http_main
+    type: http_request
+    args:
+      method: POST
+      url: "http://{server_addr}/form"
+      async: false
+      form:
+        client: "${{client_ip}}"
+        name: "${{qname}}"
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("http_main")
+        .expect("http_request plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = executor.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    let captured = wait_for_captured_request(&mut rx).await?;
+    let form = url::form_urlencoded::parse(captured.body.as_slice())
+        .into_owned()
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        captured.header("content-type"),
+        Some("application/x-www-form-urlencoded")
+    );
+    assert_eq!(form.get("client").map(String::as_str), Some("127.0.0.1"));
+    assert_eq!(form.get("name").map(String::as_str), Some("example.com"));
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-http-request")]
+#[tokio::test]
+async fn test_http_request_executor_follows_redirects() -> Result<()> {
+    let mut redirect = TestHttpRoute::new("/start".to_string(), StatusCode::FOUND, Vec::new());
+    redirect.location = Some("/final".to_string());
+    let (server_addr, mut rx) = start_recording_http_server_routes(vec![
+        redirect,
+        TestHttpRoute::new("/final".to_string(), StatusCode::OK, b"ok".to_vec()),
+    ])
+    .await?;
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: http_main
+    type: http_request
+    args:
+      method: GET
+      url: "http://{server_addr}/start"
+      async: false
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("http_main")
+        .expect("http_request plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = executor.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    let first = wait_for_captured_request(&mut rx).await?;
+    let second = wait_for_captured_request(&mut rx).await?;
+    assert_eq!(first.path, "/start");
+    assert_eq!(second.path, "/final");
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-http-request")]
+#[tokio::test]
+async fn test_http_request_executor_supports_socks5_proxy() -> Result<()> {
+    let (server_addr, mut rx) = start_recording_http_server_routes(vec![TestHttpRoute::new(
+        "/proxy".to_string(),
+        StatusCode::OK,
+        b"ok".to_vec(),
+    )])
+    .await?;
+    let socks5_addr = start_test_socks5_proxy().await?;
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: http_main
+    type: http_request
+    args:
+      method: GET
+      url: "http://{server_addr}/proxy"
+      async: false
+      socks5: "{socks5_addr}"
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("http_main")
+        .expect("http_request plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = executor.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    let captured = wait_for_captured_request(&mut rx).await?;
+    assert_eq!(captured.path, "/proxy");
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-http-request")]
+#[tokio::test]
+async fn test_http_request_executor_error_modes_map_sync_failures() -> Result<()> {
+    let server_addr =
+        start_test_http_server(vec![("/missing", StatusCode::NOT_FOUND, "missing")]).await?;
+
+    async fn run_case(
+        server_addr: SocketAddr,
+        error_mode: &str,
+    ) -> Result<std::result::Result<ExecStep, DnsError>> {
+        let yaml = format!(
+            r#"
+log:
+  level: info
+plugins:
+  - tag: http_main
+    type: http_request
+    args:
+      method: GET
+      url: "http://{server_addr}/missing"
+      async: false
+      error_mode: {error_mode}
+"#,
+        );
+
+        let config = parse_config(&yaml)?;
+        let registry = plugin::init(config).await?;
+        let executor = registry
+            .get_plugin("http_main")
+            .expect("http_request plugin should exist")
+            .to_executor();
+        let mut context = make_context(registry.clone(), "example.com.");
+        let result = executor.execute(&mut context).await;
+        registry.destroy().await;
+        Ok(result)
+    }
+
+    let continue_result = run_case(server_addr, "continue").await?;
+    assert!(matches!(continue_result?, ExecStep::Next));
+
+    let stop_result = run_case(server_addr, "stop").await?;
+    assert!(matches!(stop_result?, ExecStep::Stop));
+
+    let fail_result = run_case(server_addr, "fail").await?;
+    let fail_err = fail_result.expect_err("fail mode should return an error");
+    assert!(fail_err.to_string().contains("http_request plugin"));
+    Ok(())
+}
+
+#[cfg(feature = "plugin-http-request")]
+#[tokio::test]
+async fn test_http_request_executor_async_mode_enqueues_and_sends_in_background() -> Result<()> {
+    let (server_addr, mut rx) = start_recording_http_server_routes(vec![TestHttpRoute::new(
+        "/async".to_string(),
+        StatusCode::OK,
+        b"ok".to_vec(),
+    )])
+    .await?;
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: http_main
+    type: http_request
+    args:
+      method: POST
+      url: "http://{server_addr}/async"
+      async: true
+      body: "${{qname}}"
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("http_main")
+        .expect("http_request plugin should exist")
+        .to_executor();
+    let mut context = make_context(registry.clone(), "example.com.");
+
+    let step = executor.execute(&mut context).await?;
+
+    assert!(matches!(step, ExecStep::Next));
+    let captured = wait_for_captured_request(&mut rx).await?;
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.body_text(), "example.com");
+
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-http-request")]
+#[tokio::test]
+async fn test_http_request_executor_async_queue_full_returns_stop() -> Result<()> {
+    let mut slow_route = TestHttpRoute::new("/slow".to_string(), StatusCode::OK, b"ok".to_vec());
+    slow_route.response_delay = Some(Duration::from_millis(400));
+    let (server_addr, _rx) = start_recording_http_server_routes(vec![slow_route]).await?;
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: http_main
+    type: http_request
+    args:
+      method: GET
+      url: "http://{server_addr}/slow"
+      async: true
+      queue_size: 1
+      error_mode: stop
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("http_main")
+        .expect("http_request plugin should exist")
+        .to_executor();
+
+    let mut saw_stop = false;
+    for _ in 0..16 {
+        let mut context = make_context(registry.clone(), "example.com.");
+        let step = executor.execute(&mut context).await?;
+        if matches!(step, ExecStep::Stop) {
+            saw_stop = true;
+            break;
+        }
+    }
+
+    assert!(saw_stop, "async queue should eventually become full");
+    registry.destroy().await;
+    Ok(())
+}
+
+#[cfg(feature = "plugin-http-request")]
+#[tokio::test]
+async fn test_http_request_executor_async_closed_channel_returns_stop() -> Result<()> {
+    let server_addr = start_test_http_server(vec![("/closed", StatusCode::OK, "ok")]).await?;
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: http_main
+    type: http_request
+    args:
+      method: GET
+      url: "http://{server_addr}/closed"
+      async: true
+      error_mode: stop
+"#,
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let executor = registry
+        .get_plugin("http_main")
+        .expect("http_request plugin should exist")
+        .to_executor();
+
+    registry.destroy().await;
+
+    let mut context = make_context(registry.clone(), "example.com.");
+    let step = executor.execute(&mut context).await?;
+    assert!(matches!(step, ExecStep::Stop));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_linux_ipset_executor_writes_masked_prefix_to_kernel_set() -> Result<()> {
+    if !should_run_linux_system_plugin_tests("ipset", "help") {
+        return Ok(());
+    }
+
+    let set_name = unique_system_object_name("oxidns_test_ipset");
+    let _cleanup = CommandCleanup::new(vec![(
+        "ipset".to_string(),
+        vec!["destroy".to_string(), set_name.clone()],
+    )]);
+    run_command(
+        "ipset",
+        &["create", &set_name, "hash:net", "family", "inet"],
+    )?;
+
+    let listen = reserve_local_udp_addr()?;
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: hosts
+    type: hosts
+    args:
+      entries:
+        - "full:example.test 192.0.2.10"
+  - tag: ipset_main
+    type: ipset
+    args:
+      set_name4: "{set_name}"
+      mask4: 24
+  - tag: seq
+    type: sequence
+    args:
+      - exec: $hosts
+      - exec: $ipset_main
+  - tag: udp
+    type: udp_server
+    args:
+      entry: seq
+      listen: "{listen}"
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let response_result = exchange_udp_query(listen, "example.test.").await;
+    let kernel_result =
+        wait_for_command_output_contains("ipset", &["list", &set_name], "192.0.2.0/24").await;
+    registry.destroy().await;
+
+    let response = response_result?;
+    assert_eq!(response.rcode(), Rcode::NoError);
+    kernel_result?;
+    Ok(())
+}
+
+/// Regression for issue #122: with mask=32, every DNS answer becomes a /32
+/// CIDR, which forces `nftset_operate` down the interval-set path. A previous
+/// byte-order bug in `nftset_get_flags` made `is_interval` always false on
+/// little-endian hosts, so the executor returned `UnsupportedEntry` for every
+/// add. This test also re-queries the same name to confirm that EEXIST from
+/// the kernel is treated as a no-op and does not disable the plugin.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_linux_nftset_executor_handles_slash32_and_repeated_adds() -> Result<()> {
+    if !should_run_linux_system_plugin_tests("nft", "--version") {
+        return Ok(());
+    }
+
+    let table_name = unique_system_object_name("oxidns_test_nft_122");
+    let set_name = "oxidns_test_v4_122".to_string();
+    let _cleanup = CommandCleanup::new(vec![(
+        "nft".to_string(),
+        vec![
+            "delete".to_string(),
+            "table".to_string(),
+            "ip".to_string(),
+            table_name.clone(),
+        ],
+    )]);
+    run_command("nft", &["add", "table", "ip", &table_name])?;
+    run_command(
+        "nft",
+        &[
+            "add",
+            "set",
+            "ip",
+            &table_name,
+            &set_name,
+            "{ type ipv4_addr; flags interval; }",
+        ],
+    )?;
+
+    let listen = reserve_local_udp_addr()?;
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: hosts
+    type: hosts
+    args:
+      entries:
+        - "full:example.test 192.0.2.10"
+  - tag: nftset_main
+    type: nftset
+    args:
+      ipv4:
+        table_family: ip
+        table_name: "{table_name}"
+        set_name: "{set_name}"
+        mask: 32
+  - tag: seq
+    type: sequence
+    args:
+      - exec: $hosts
+      - exec: $nftset_main
+  - tag: udp
+    type: udp_server
+    args:
+      entry: seq
+      listen: "{listen}"
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+
+    // First query forces a fresh interval add through `nftset_get_flags`. With
+    // the byte-order bug this returned `UnsupportedEntry` and nothing reached
+    // the kernel.
+    let first = exchange_udp_query(listen, "example.test.").await?;
+    assert_eq!(first.rcode(), Rcode::NoError);
+    let kernel_result = wait_for_command_output_contains(
+        "nft",
+        &["list", "table", "ip", &table_name],
+        "192.0.2.10",
+    )
+    .await;
+
+    // Second query: kernel will respond EEXIST for the same /32. The executor
+    // must treat it as a skip and stay operational; previously this disabled
+    // the plugin permanently.
+    let second = exchange_udp_query(listen, "example.test.").await?;
+    assert_eq!(second.rcode(), Rcode::NoError);
+
+    registry.destroy().await;
+    kernel_result?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_linux_nftset_executor_writes_masked_prefix_to_kernel_set() -> Result<()> {
+    if !should_run_linux_system_plugin_tests("nft", "--version") {
+        return Ok(());
+    }
+
+    let table_name = unique_system_object_name("oxidns_test_nft");
+    let set_name = "oxidns_test_v4".to_string();
+    let _cleanup = CommandCleanup::new(vec![(
+        "nft".to_string(),
+        vec![
+            "delete".to_string(),
+            "table".to_string(),
+            "ip".to_string(),
+            table_name.clone(),
+        ],
+    )]);
+    run_command("nft", &["add", "table", "ip", &table_name])?;
+    run_command(
+        "nft",
+        &[
+            "add",
+            "set",
+            "ip",
+            &table_name,
+            &set_name,
+            "{ type ipv4_addr; flags interval; }",
+        ],
+    )?;
+
+    let listen = reserve_local_udp_addr()?;
+    let yaml = format!(
+        r#"
+log:
+  level: info
+plugins:
+  - tag: hosts
+    type: hosts
+    args:
+      entries:
+        - "full:example.test 192.0.2.10"
+  - tag: nftset_main
+    type: nftset
+    args:
+      ipv4:
+        table_family: ip
+        table_name: "{table_name}"
+        set_name: "{set_name}"
+        mask: 24
+  - tag: seq
+    type: sequence
+    args:
+      - exec: $hosts
+      - exec: $nftset_main
+  - tag: udp
+    type: udp_server
+    args:
+      entry: seq
+      listen: "{listen}"
+"#
+    );
+
+    let config = parse_config(&yaml)?;
+    let registry = plugin::init(config).await?;
+    let response_result = exchange_udp_query(listen, "example.test.").await;
+    let kernel_result = wait_for_command_output_contains(
+        "nft",
+        &["list", "table", "ip", &table_name],
+        "192.0.2.0/24",
+    )
+    .await;
+    registry.destroy().await;
+
+    let response = response_result?;
+    assert_eq!(response.rcode(), Rcode::NoError);
+    kernel_result?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_tcp_disconnect_preserves_cache_fill_and_shutdown_waits_for_requests() -> Result<()> {
+    check_tcp_request_drain(None).await
+}
+
+#[cfg(feature = "server-dot")]
+#[tokio::test]
+async fn test_dot_disconnect_preserves_cache_fill_and_shutdown_waits_for_requests() -> Result<()> {
+    check_tcp_request_drain(Some(12)).await?;
+    check_tcp_request_drain(Some(13)).await
+}
+
+trait TestDnsStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TestDnsStream for T {}
+
+async fn connect_drain_test_client(
+    listen: SocketAddr,
+    tls_version: Option<u16>,
+) -> Result<Box<dyn TestDnsStream>> {
+    let stream = tokio::net::TcpStream::connect(listen).await?;
+    #[cfg(feature = "server-dot")]
+    if let Some(version) = tls_version {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in
+            rustls_pemfile::certs(&mut include_bytes!("fixtures/server-tls/cert.pem").as_slice())
+        {
+            roots
+                .add(cert?)
+                .map_err(|error| DnsError::runtime(error.to_string()))?;
+        }
+        let version = if version == 12 {
+            &rustls::version::TLS12
+        } else {
+            &rustls::version::TLS13
+        };
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[version])
+            .map_err(|error| DnsError::runtime(error.to_string()))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        return Ok(Box::new(
+            connector
+                .connect("localhost".try_into().unwrap(), stream)
+                .await?,
+        ));
+    }
+    #[cfg(not(feature = "server-dot"))]
+    assert!(tls_version.is_none());
+    Ok(Box::new(stream))
+}
+
+async fn check_tcp_request_drain(tls_version: Option<u16>) -> Result<()> {
+    use oxidns::infra::network::transport::tcp::{TcpTransportReader, TcpTransportWriter};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    let upstream = UdpSocket::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream.local_addr()?;
+    let metrics_config = if cfg!(feature = "metrics") {
+        "  - tag: disconnect_metrics\n    type: metrics_collector\n"
+    } else {
+        ""
+    };
+    let metrics_step = if cfg!(feature = "metrics") {
+        "      - exec: $disconnect_metrics\n"
+    } else {
+        ""
+    };
+    let tls_config = if tls_version.is_some() {
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/server-tls");
+        format!(
+            "      cert: {}\n      key: {}\n",
+            serde_json::to_string(&fixtures.join("cert.pem"))?,
+            serde_json::to_string(&fixtures.join("key.pem"))?
+        )
+    } else {
+        String::new()
+    };
+    let mut initialized = None;
+    for _ in 0..16 {
+        let reservation = TcpListener::bind("127.0.0.1:0").await?;
+        let listen = reservation.local_addr()?;
+        let config = parse_config(&format!(
+            r#"
+log:
+  level: info
+plugins:
+{metrics_config}  - tag: disconnect_cache
+    type: cache
+    args:
+      short_circuit: true
+  - tag: disconnect_forward
+    type: forward
+    args:
+      upstreams:
+        - addr: "udp://{upstream_addr}"
+          timeout: 5s
+  - tag: disconnect_sequence
+    type: sequence
+    args:
+{metrics_step}      - exec: $disconnect_cache
+      - exec: $disconnect_forward
+  - tag: disconnect_tcp
+    type: tcp_server
+    args:
+      entry: disconnect_sequence
+      listen: "{listen}"
+{tls_config}"#
+        ))?;
+        drop(reservation);
+        match plugin::init(config).await {
+            Ok(runtime) => {
+                initialized = Some((runtime, listen));
+                break;
+            }
+            Err(error) if error.to_string().contains("Failed to bind TCP socket") => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let (runtime, listen) = initialized.expect("TCP test listener should bind");
+    let outcome = async {
+        let query = make_context(runtime.clone(), "abandoned.test.")
+            .request()
+            .clone();
+        let mut abandoned = connect_drain_test_client(listen, tls_version).await?;
+        TcpTransportWriter::new(&mut abandoned)
+            .write_message(&query)
+            .await?;
+        let mut buf = [0u8; 4096];
+        let (len, peer) = timeout(Duration::from_secs(2), upstream.recv_from(&mut buf))
+            .await
+            .map_err(|_| DnsError::runtime("first request did not reach upstream"))??;
+        let pending = Message::from_bytes(&buf[..len])?;
+        drop(abandoned);
+
+        // Another connection must remain usable while the abandoned request
+        // is still waiting on its upstream response.
+        let healthy = connect_drain_test_client(listen, tls_version).await?;
+        let (mut reader, writer) = tokio::io::split(healthy);
+        let mut writer = TcpTransportWriter::new(writer);
+        let healthy_query = make_context(runtime.clone(), "healthy.test.")
+            .request()
+            .clone();
+        writer.write_message(&healthy_query).await?;
+        let (len, healthy_peer) = timeout(Duration::from_secs(2), upstream.recv_from(&mut buf))
+            .await
+            .map_err(|_| DnsError::runtime("second request did not reach upstream"))??;
+        let healthy_request = Message::from_bytes(&buf[..len])?;
+        assert_eq!(
+            healthy_request.first_question().unwrap().name().to_fqdn(),
+            "healthy.test."
+        );
+        upstream
+            .send_to(
+                &healthy_request.response(Rcode::NoError).to_bytes()?,
+                healthy_peer,
+            )
+            .await?;
+        let reply = timeout(
+            Duration::from_secs(2),
+            TcpTransportReader::new(&mut reader).read_message(),
+        )
+        .await
+        .map_err(|_| DnsError::runtime("healthy TCP connection did not respond"))??;
+        assert_eq!(reply.id(), healthy_query.id());
+
+        let server = runtime.get_plugin("disconnect_tcp").unwrap();
+        let shutdown = server.as_plugin().destroy();
+        tokio::pin!(shutdown);
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        let mut byte = [0];
+        let closed = timeout(Duration::from_secs(2), reader.read(&mut byte))
+            .await
+            .map_err(|_| DnsError::runtime("shutdown retained TCP writer"))?;
+        match closed {
+            Ok(0) => {}
+            Err(error)
+                if tls_version.is_some() && error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            other => panic!("Expected closed transport, got {other:?}"),
+        }
+        assert!(
+            futures::poll!(&mut shutdown).is_pending(),
+            "server must wait for accepted requests"
+        );
+
+        let mut response = pending.response(Rcode::NoError);
+        response.add_answer(oxidns::proto::Record::from_rdata(
+            pending.first_question().unwrap().name().clone(),
+            60,
+            oxidns::proto::RData::A(oxidns::proto::rdata::A(Ipv4Addr::new(192, 0, 2, 35))),
+        ));
+        upstream.send_to(&response.to_bytes()?, peer).await?;
+        timeout(Duration::from_secs(2), &mut shutdown)
+            .await
+            .map_err(|_| DnsError::runtime("server did not drain accepted request"))??;
+
+        let cache = runtime
+            .get_plugin("disconnect_cache")
+            .unwrap()
+            .to_executor();
+        let mut cached = make_context(runtime.clone(), "abandoned.test.");
+        cache.execute(&mut cached).await?;
+        assert_eq!(
+            cached
+                .response()
+                .expect("disconnected request must still populate cache")
+                .answers()
+                .len(),
+            1
+        );
+        #[cfg(feature = "metrics")]
+        {
+            let metrics = oxidns::infra::observability::metrics::render_prometheus_metrics();
+            assert!(
+                metrics
+                    .lines()
+                    .any(|line| line.starts_with("query_inflight{")
+                        && line.contains("disconnect_metrics")
+                        && line.ends_with(" 0")),
+                "{metrics}"
+            );
+            assert!(
+                metrics.lines().any(|line| line.starts_with("query_total{")
+                    && line.contains("disconnect_metrics")
+                    && line.ends_with(" 2")),
+                "{metrics}"
+            );
+        }
+        Ok::<(), DnsError>(())
+    }
+    .await;
+    timeout(Duration::from_secs(8), runtime.destroy())
+        .await
+        .map_err(|_| DnsError::runtime("TCP test cleanup timed out"))?;
+    outcome
+}

@@ -1,0 +1,1542 @@
+// SPDX-FileCopyrightText: 2025 Sven Shi
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! Configuration structure definitions
+//!
+//! Defines the schema for OxiDNS configuration files (YAML format).
+
+use std::collections::HashMap;
+use std::net::IpAddr;
+
+use serde::Deserialize;
+use serde_yaml_ng::Value;
+use thiserror::Error;
+
+use crate::infra::network::proxy::validate_socks5_syntax;
+use crate::infra::system::parse_simple_duration;
+
+/// Configuration validation errors
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("Plugin tag cannot be empty")]
+    EmptyPluginTag,
+
+    #[error("Invalid plugin tag '{tag}': {reason}")]
+    InvalidPluginTag {
+        tag: String,
+        #[source]
+        reason: PluginTagValidationError,
+    },
+
+    #[error("Plugin tag '{0}' uses a reserved quick-setup prefix")]
+    ReservedPluginTagPrefix(String),
+
+    #[error("Invalid log level: {0}")]
+    InvalidLogLevel(String),
+
+    #[error("Plugin type cannot be empty")]
+    EmptyPluginType,
+
+    #[error("runtime.worker_threads must be greater than 0")]
+    InvalidRuntimeWorkerThreads,
+
+    #[error("api.http.listen cannot be empty")]
+    EmptyApiHttpListen,
+
+    #[error("api.http.auth.basic.username cannot be empty")]
+    EmptyApiBasicAuthUsername,
+
+    #[error("api.http.auth.basic.password cannot be empty")]
+    EmptyApiBasicAuthPassword,
+
+    #[error("api.http.ssl.cert and api.http.ssl.key must be configured together")]
+    IncompleteApiTlsConfig,
+
+    #[error("api.http.ssl.require_client_cert requires api.http.ssl.client_ca")]
+    MissingApiTlsClientCa,
+
+    #[error("api.http.webui.root cannot be empty")]
+    EmptyApiWebUiRoot,
+
+    #[error("api.http.webui.index cannot be empty")]
+    EmptyApiWebUiIndex,
+
+    #[error("Invalid network outbound config: {0}")]
+    InvalidNetworkOutbound(String),
+
+    #[error(
+        "Duplicate plugin tag '{tag}' found at plugins[{first_index}] and plugins[{duplicate_index}]"
+    )]
+    DuplicatePluginTag {
+        tag: String,
+        first_index: usize,
+        duplicate_index: usize,
+    },
+}
+
+/// Main server configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct Config {
+    /// Additional configuration files whose plugins should be loaded first.
+    #[serde(default)]
+    pub include: Vec<String>,
+
+    /// Tokio runtime configuration.
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+
+    /// Optional management API configuration.
+    #[serde(default)]
+    pub api: ApiConfig,
+
+    /// Logging configuration (level, file output)
+    #[serde(default)]
+    pub log: LogConfig,
+
+    /// Shared network policy configuration.
+    #[serde(default)]
+    pub network: NetworkConfig,
+
+    /// List of plugins to load and their configurations
+    #[serde(default)]
+    pub plugins: Vec<PluginConfig>,
+}
+
+impl Config {
+    /// Validate configuration
+    ///
+    /// Validates the configuration structure (log level, plugin tags/types).
+    /// Plugin-specific validation (e.g., listen addresses, upstreams) is
+    /// delegated to each PluginFactory during plugin initialization.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if matches!(self.runtime.worker_threads, Some(0)) {
+            return Err(ConfigError::InvalidRuntimeWorkerThreads);
+        }
+
+        // Validate log level
+        match self.log.level.to_lowercase().as_str() {
+            "off" | "trace" | "debug" | "info" | "warn" | "error" => {}
+            _ => return Err(ConfigError::InvalidLogLevel(self.log.level.clone())),
+        }
+
+        if let Some(http) = &self.api.http {
+            let resolved = http.resolve();
+            if resolved.listen.trim().is_empty() {
+                return Err(ConfigError::EmptyApiHttpListen);
+            }
+
+            if let Some(ssl) = &resolved.ssl {
+                let cert_present = ssl.cert.is_some();
+                let key_present = ssl.key.is_some();
+                if cert_present != key_present {
+                    return Err(ConfigError::IncompleteApiTlsConfig);
+                }
+                if ssl.require_client_cert.unwrap_or(false) && ssl.client_ca.is_none() {
+                    return Err(ConfigError::MissingApiTlsClientCa);
+                }
+            }
+
+            if let Some(ApiAuthConfig::Basic { username, password }) = &resolved.auth {
+                if username.trim().is_empty() {
+                    return Err(ConfigError::EmptyApiBasicAuthUsername);
+                }
+                if password.trim().is_empty() {
+                    return Err(ConfigError::EmptyApiBasicAuthPassword);
+                }
+            }
+
+            if let Some(webui) = &resolved.webui {
+                if webui.root.trim().is_empty() {
+                    return Err(ConfigError::EmptyApiWebUiRoot);
+                }
+                if matches!(webui.index.as_deref(), Some(index) if index.trim().is_empty()) {
+                    return Err(ConfigError::EmptyApiWebUiIndex);
+                }
+            }
+        }
+
+        self.network.validate()?;
+
+        // Validate plugins - basic structure checks
+        let mut seen_tags = HashMap::new();
+        for (idx, plugin) in self.plugins.iter().enumerate() {
+            // Check for empty tag
+            if plugin.tag.is_empty() {
+                return Err(ConfigError::EmptyPluginTag);
+            }
+            if let Err(reason) = validate_plugin_tag(&plugin.tag) {
+                return Err(ConfigError::InvalidPluginTag {
+                    tag: plugin.tag.clone(),
+                    reason,
+                });
+            }
+            if is_reserved_plugin_tag(&plugin.tag) {
+                return Err(ConfigError::ReservedPluginTagPrefix(plugin.tag.clone()));
+            }
+            if let Some(prev_idx) = seen_tags.insert(plugin.tag.as_str(), idx) {
+                return Err(ConfigError::DuplicatePluginTag {
+                    tag: plugin.tag.clone(),
+                    first_index: prev_idx,
+                    duplicate_index: idx,
+                });
+            }
+
+            // Check for empty type
+            if plugin.plugin_type.is_empty() {
+                return Err(ConfigError::EmptyPluginType);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Maximum byte length for a plugin tag.
+pub const MAX_PLUGIN_TAG_LENGTH: usize = 64;
+
+/// Detailed plugin-tag validation error.
+///
+/// Plugin tags are used as a single path segment in management API routes, so
+/// they deliberately use a small, readable ASCII grammar instead of relying
+/// on URL escaping behavior across clients and reverse proxies.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum PluginTagValidationError {
+    #[error("cannot be empty")]
+    Empty,
+
+    #[error("must be at most {MAX_PLUGIN_TAG_LENGTH} ASCII characters")]
+    TooLong,
+
+    #[error("must contain ASCII characters only")]
+    NonAscii,
+
+    #[error(
+        "contains invalid character '{0}'; only ASCII letters, digits, '_', '-', and '.' are allowed"
+    )]
+    InvalidCharacter(char),
+
+    #[error("contains an empty dot-separated segment")]
+    EmptySegment,
+
+    #[error("segment '{0}' must start and end with an ASCII letter or digit")]
+    InvalidSegmentBoundary(String),
+}
+
+/// Validate a user-configured plugin tag.
+///
+/// The length limit is a product-level constraint for stable configuration
+/// identifiers. Runtime-generated quick-setup tags may be longer and should
+/// use `validate_plugin_tag_path_segment` when registering API routes.
+pub fn validate_plugin_tag(tag: &str) -> Result<(), PluginTagValidationError> {
+    if tag.is_empty() {
+        return Err(PluginTagValidationError::Empty);
+    }
+    if tag.len() > MAX_PLUGIN_TAG_LENGTH {
+        return Err(PluginTagValidationError::TooLong);
+    }
+
+    validate_plugin_tag_path_segment(tag)
+}
+
+/// Validate only the syntax required for a safe, readable API path segment.
+///
+/// This intentionally does not apply [`MAX_PLUGIN_TAG_LENGTH`], because
+/// deterministic `qs.*` runtime tags include their validated parent tag plus
+/// quick-setup metadata and can therefore exceed the user-configured limit.
+pub(crate) fn validate_plugin_tag_path_segment(tag: &str) -> Result<(), PluginTagValidationError> {
+    if tag.is_empty() {
+        return Err(PluginTagValidationError::Empty);
+    }
+    if !tag.is_ascii() {
+        return Err(PluginTagValidationError::NonAscii);
+    }
+
+    if let Some(byte) = tag
+        .bytes()
+        .find(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(PluginTagValidationError::InvalidCharacter(char::from(byte)));
+    }
+
+    for segment in tag.split('.') {
+        if segment.is_empty() {
+            return Err(PluginTagValidationError::EmptySegment);
+        }
+
+        let bytes = segment.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+            return Err(PluginTagValidationError::InvalidSegmentBoundary(
+                segment.to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Return whether `tag` satisfies the plugin-tag grammar.
+pub fn is_valid_plugin_tag(tag: &str) -> bool {
+    validate_plugin_tag(tag).is_ok()
+}
+
+pub fn is_reserved_plugin_tag(tag: &str) -> bool {
+    tag.starts_with("qs.exec.") || tag.starts_with("qs.match.") || tag.starts_with("qs.cron.")
+}
+
+/// Shared network configuration.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct NetworkConfig {
+    /// Named outbound connection profiles shared by HTTP clients and upstreams.
+    #[serde(default)]
+    pub outbound: NetworkOutboundConfig,
+}
+
+impl NetworkConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        self.outbound.validate()
+    }
+}
+
+/// Global outbound profile registry.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct NetworkOutboundConfig {
+    /// Optional default profile used when a caller does not name one.
+    pub default: Option<String>,
+
+    /// Named outbound profiles.
+    #[serde(default)]
+    pub profiles: HashMap<String, OutboundProfileConfig>,
+}
+
+impl NetworkOutboundConfig {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(default) = self.default.as_deref() {
+            if default.trim().is_empty() {
+                return Err(ConfigError::InvalidNetworkOutbound(
+                    "default profile name cannot be empty".to_string(),
+                ));
+            }
+            if default != default.trim() {
+                return Err(ConfigError::InvalidNetworkOutbound(format!(
+                    "default profile '{}' cannot contain leading or trailing whitespace",
+                    default
+                )));
+            }
+            if !self.profiles.contains_key(default) {
+                return Err(ConfigError::InvalidNetworkOutbound(format!(
+                    "default profile '{}' is not defined",
+                    default
+                )));
+            }
+        }
+
+        for (name, profile) in &self.profiles {
+            if name.trim().is_empty() {
+                return Err(ConfigError::InvalidNetworkOutbound(
+                    "profile name cannot be empty".to_string(),
+                ));
+            }
+            if name != name.trim() {
+                return Err(ConfigError::InvalidNetworkOutbound(format!(
+                    "profile name '{}' cannot contain leading or trailing whitespace",
+                    name
+                )));
+            }
+            profile.validate(name)?;
+        }
+        Ok(())
+    }
+}
+
+/// One named outbound connection profile.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundProfileConfig {
+    pub resolver: Option<OutboundResolverConfig>,
+    pub proxy: Option<OutboundProxyConfig>,
+}
+
+impl OutboundProfileConfig {
+    fn validate(&self, profile_name: &str) -> Result<(), ConfigError> {
+        if let Some(resolver) = &self.resolver {
+            resolver.validate(profile_name)?;
+        }
+        if let Some(proxy) = &self.proxy {
+            proxy.validate(profile_name)?;
+        }
+        if self.resolver_uses_profile_proxy()
+            && !matches!(self.proxy, Some(OutboundProxyConfig::Socks5 { .. }))
+        {
+            return Err(ConfigError::InvalidNetworkOutbound(format!(
+                "profile '{}' resolver.proxy profile requires a socks5 proxy",
+                profile_name
+            )));
+        }
+        Ok(())
+    }
+
+    fn resolver_uses_profile_proxy(&self) -> bool {
+        matches!(
+            self.resolver,
+            Some(OutboundResolverConfig::Nameservers(
+                OutboundResolverDetailedConfig {
+                    proxy: Some(OutboundResolverProxyConfig::Profile),
+                    ..
+                }
+            ))
+        )
+    }
+}
+
+/// Resolver policy for an outbound profile.
+///
+/// This resolver is used by OxiDNS-owned outbound clients and opt-in upstreams.
+/// It is intentionally separate from legacy upstream `bootstrap`, whose field
+/// remains available on each upstream for local override compatibility.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OutboundResolverConfig {
+    Mode(String),
+    Nameservers(OutboundResolverDetailedConfig),
+}
+
+impl OutboundResolverConfig {
+    fn validate(&self, profile_name: &str) -> Result<(), ConfigError> {
+        match self {
+            Self::Mode(mode) if mode.trim().eq_ignore_ascii_case("system") => Ok(()),
+            Self::Mode(mode) => Err(ConfigError::InvalidNetworkOutbound(format!(
+                "profile '{}' has invalid resolver mode '{}'",
+                profile_name, mode
+            ))),
+            Self::Nameservers(config) => config.validate(profile_name),
+        }
+    }
+}
+
+/// Detailed resolver policy for an outbound profile.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundResolverDetailedConfig {
+    pub nameservers: Vec<OutboundNameserverConfig>,
+    pub ip_version: Option<u8>,
+    pub timeout: Option<String>,
+    pub proxy: Option<OutboundResolverProxyConfig>,
+}
+
+impl OutboundResolverDetailedConfig {
+    fn validate(&self, profile_name: &str) -> Result<(), ConfigError> {
+        if self.nameservers.is_empty() {
+            return Err(ConfigError::InvalidNetworkOutbound(format!(
+                "profile '{}' resolver.nameservers requires at least one server",
+                profile_name
+            )));
+        }
+        if !matches!(self.ip_version, None | Some(4) | Some(6)) {
+            return Err(ConfigError::InvalidNetworkOutbound(format!(
+                "profile '{}' resolver.ip_version must be 4 or 6",
+                profile_name
+            )));
+        }
+        if let Some(timeout) = &self.timeout {
+            parse_simple_duration(timeout).map_err(|err| {
+                ConfigError::InvalidNetworkOutbound(format!(
+                    "profile '{}' resolver.timeout is invalid: {}",
+                    profile_name, err
+                ))
+            })?;
+        }
+
+        let resolver_uses_profile_proxy = matches!(
+            self.proxy
+                .as_ref()
+                .unwrap_or(&OutboundResolverProxyConfig::None),
+            OutboundResolverProxyConfig::Profile
+        );
+        for nameserver in &self.nameservers {
+            nameserver.validate(profile_name, resolver_uses_profile_proxy)?;
+        }
+        Ok(())
+    }
+}
+
+/// One outbound resolver nameserver endpoint.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundNameserverConfig {
+    pub addr: String,
+    pub dial_addr: Option<IpAddr>,
+}
+
+impl OutboundNameserverConfig {
+    fn validate(
+        &self,
+        profile_name: &str,
+        resolver_uses_profile_proxy: bool,
+    ) -> Result<(), ConfigError> {
+        if self.addr.trim().is_empty() {
+            return Err(ConfigError::InvalidNetworkOutbound(format!(
+                "profile '{}' resolver.nameservers addr cannot be empty",
+                profile_name
+            )));
+        }
+
+        let parsed = parse_nameserver_addr(self.addr.as_str()).ok_or_else(|| {
+            ConfigError::InvalidNetworkOutbound(format!(
+                "profile '{}' resolver.nameservers has invalid addr '{}'",
+                profile_name, self.addr
+            ))
+        })?;
+        if let Some(hint) = parsed.rebuild_hint() {
+            return Err(ConfigError::InvalidNetworkOutbound(format!(
+                "profile '{}' resolver.nameservers addr '{}': {}",
+                profile_name, self.addr, hint
+            )));
+        }
+
+        if parsed.host.parse::<IpAddr>().is_err() && self.dial_addr.is_none() {
+            return Err(ConfigError::InvalidNetworkOutbound(format!(
+                "profile '{}' resolver.nameservers domain addr '{}' requires dial_addr",
+                profile_name, self.addr
+            )));
+        }
+
+        if resolver_uses_profile_proxy && parsed.proxy_unsupported {
+            return Err(ConfigError::InvalidNetworkOutbound(format!(
+                "profile '{}' resolver proxy cannot be used with {} nameserver '{}'",
+                profile_name, parsed.scheme, self.addr
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+struct ParsedNameserverAddr {
+    scheme: String,
+    host: String,
+    proxy_unsupported: bool,
+}
+
+impl ParsedNameserverAddr {
+    fn rebuild_hint(&self) -> Option<&'static str> {
+        match self.scheme.as_str() {
+            "tls" | "tls+pipeline" if !cfg!(feature = "resolver-dot") => Some(
+                "nameserver DoT is not compiled into this build; rebuild with --features resolver-dot",
+            ),
+            "https" | "doh" if !cfg!(feature = "resolver-doh") => Some(
+                "nameserver DoH is not compiled into this build; rebuild with --features resolver-doh",
+            ),
+            "h3" if !cfg!(feature = "resolver-doh3") => Some(
+                "nameserver DoH3 is not compiled into this build; rebuild with --features resolver-doh3",
+            ),
+            "quic" | "doq" if !cfg!(feature = "resolver-doq") => Some(
+                "nameserver DoQ is not compiled into this build; rebuild with --features resolver-doq",
+            ),
+            _ => None,
+        }
+    }
+}
+
+fn parse_nameserver_addr(addr: &str) -> Option<ParsedNameserverAddr> {
+    let raw = addr.trim();
+    let normalized;
+    let candidate = if raw.contains("//") {
+        raw
+    } else {
+        normalized = format!("udp://{raw}");
+        normalized.as_str()
+    };
+    let url = url::Url::parse(candidate).ok()?;
+    let host = match url.host()? {
+        url::Host::Domain(domain) => domain.to_string(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => ip.to_string(),
+    };
+    let scheme = url.scheme().to_ascii_lowercase();
+    if !matches!(
+        scheme.as_str(),
+        "udp"
+            | "tcp"
+            | "tcp+pipeline"
+            | "tls"
+            | "tls+pipeline"
+            | "https"
+            | "doh"
+            | "h3"
+            | "quic"
+            | "doq"
+    ) {
+        return None;
+    }
+    let proxy_unsupported = matches!(scheme.as_str(), "udp" | "doq" | "quic" | "h3");
+    Some(ParsedNameserverAddr {
+        scheme,
+        host,
+        proxy_unsupported,
+    })
+}
+
+/// Resolver proxy policy for outbound profile nameservers.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundResolverProxyConfig {
+    #[default]
+    None,
+    Profile,
+}
+
+/// One or more legacy upstream bootstrap DNS servers.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum BootstrapServerConfig {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl BootstrapServerConfig {
+    pub fn servers(&self) -> Vec<&str> {
+        match self {
+            Self::One(server) => vec![server.as_str()],
+            Self::Many(servers) => servers.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// Proxy policy for an outbound profile.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OutboundProxyConfig {
+    Mode(String),
+    Socks5 { socks5: String },
+}
+
+impl OutboundProxyConfig {
+    fn validate(&self, profile_name: &str) -> Result<(), ConfigError> {
+        match self {
+            Self::Mode(mode)
+                if mode.trim().eq_ignore_ascii_case("none")
+                    || mode.trim().eq_ignore_ascii_case("direct") =>
+            {
+                Ok(())
+            }
+            Self::Mode(mode) => Err(ConfigError::InvalidNetworkOutbound(format!(
+                "profile '{}' has invalid proxy mode '{}'",
+                profile_name, mode
+            ))),
+            Self::Socks5 { socks5 } if socks5.trim().is_empty() => {
+                Err(ConfigError::InvalidNetworkOutbound(format!(
+                    "profile '{}' socks5 proxy cannot be empty",
+                    profile_name
+                )))
+            }
+            Self::Socks5 { socks5 } if !validate_socks5_syntax(socks5) => {
+                Err(ConfigError::InvalidNetworkOutbound(format!(
+                    "profile '{}' has invalid socks5 proxy '{}'",
+                    profile_name, socks5
+                )))
+            }
+            Self::Socks5 { .. } => Ok(()),
+        }
+    }
+}
+
+/// Management API configuration.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ApiConfig {
+    /// Optional HTTP management API configuration.
+    pub http: Option<ApiHttpConfig>,
+}
+
+/// `api.http` supports shorthand string and detailed object forms.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ApiHttpConfig {
+    Listen(String),
+    Detailed(Box<ApiHttpDetailedConfig>),
+}
+
+impl ApiHttpConfig {
+    /// Resolve user-facing config variants into one canonical structure.
+    pub fn resolve(&self) -> ResolvedApiHttpConfig {
+        match self {
+            Self::Listen(listen) => ResolvedApiHttpConfig {
+                listen: listen.clone(),
+                ssl: None,
+                auth: None,
+                cors: None,
+                webui: None,
+            },
+            Self::Detailed(config) => ResolvedApiHttpConfig {
+                listen: config.listen.clone(),
+                ssl: config.ssl.clone(),
+                auth: config.auth.clone(),
+                cors: config.cors.clone(),
+                webui: config.webui.clone(),
+            },
+        }
+    }
+}
+
+/// CORS settings for the management API.
+///
+/// When present, cross-origin requests matching the configured origins are
+/// accepted. This is needed when the WebUI is served from a different host
+/// or port than the API server.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ApiCorsConfig {
+    /// List of allowed `Origin` values (e.g. `http://localhost:3000`).
+    ///
+    /// Each entry is matched exactly against the incoming `Origin` header.
+    /// Use `"*"` to allow any origin (credentials will not be sent in that
+    /// case).
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    /// Runtime-only flag used by the management API when CORS is inferred from
+    /// a wildcard listen address such as `0.0.0.0` or `[::]`.
+    #[serde(default, skip)]
+    pub allow_any_origin: bool,
+    /// Runtime-only host allowlist inferred from the API listen address.
+    ///
+    /// These entries match the host part of the browser `Origin` header and do
+    /// not constrain the WebUI port.
+    #[serde(default, skip)]
+    pub allowed_origin_hosts: Vec<String>,
+}
+
+/// Expanded HTTP API configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiHttpDetailedConfig {
+    pub listen: String,
+    pub ssl: Option<ApiTlsConfig>,
+    pub auth: Option<ApiAuthConfig>,
+    pub cors: Option<ApiCorsConfig>,
+    pub webui: Option<ApiWebUiConfig>,
+}
+
+/// Static WebUI files served by the management API listener.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiWebUiConfig {
+    pub root: String,
+    pub index: Option<String>,
+}
+
+/// TLS settings for the management API.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiTlsConfig {
+    pub cert: Option<String>,
+    pub key: Option<String>,
+    pub client_ca: Option<String>,
+    pub require_client_cert: Option<bool>,
+}
+
+/// Authentication settings for the management API.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApiAuthConfig {
+    Basic { username: String, password: String },
+}
+
+/// Canonical HTTP API configuration used at runtime.
+#[derive(Debug, Clone)]
+pub struct ResolvedApiHttpConfig {
+    pub listen: String,
+    pub ssl: Option<ApiTlsConfig>,
+    pub auth: Option<ApiAuthConfig>,
+    pub cors: Option<ApiCorsConfig>,
+    pub webui: Option<ApiWebUiConfig>,
+}
+
+/// Tokio runtime configuration.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RuntimeConfig {
+    /// Number of Tokio worker threads for the multi-thread runtime.
+    ///
+    /// When omitted, OxiDNS uses the system's available CPU parallelism.
+    pub worker_threads: Option<usize>,
+}
+
+impl RuntimeConfig {
+    /// Resolve the effective Tokio worker-thread count.
+    pub fn effective_worker_threads(&self) -> usize {
+        self.worker_threads.unwrap_or_else(default_worker_threads)
+    }
+}
+
+fn default_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+}
+
+/// Logging configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct LogConfig {
+    /// Log level: off, trace, debug, info, warn, error
+    #[serde(default = "default_level")]
+    pub level: String,
+
+    /// Optional file path for log output (in addition to console)
+    pub file: Option<String>,
+
+    #[serde(default)]
+    pub rotation: LogRotation,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LogRotation {
+    #[default]
+    Never,
+    Minutely {
+        max_files: Option<usize>,
+    },
+    Hourly {
+        max_files: Option<usize>,
+    },
+    Daily {
+        max_files: Option<usize>,
+    },
+    Weekly {
+        max_files: Option<usize>,
+    },
+}
+
+impl LogRotation {
+    #[inline]
+    pub fn max_files(&self) -> Option<usize> {
+        match self {
+            LogRotation::Never => None,
+            LogRotation::Minutely { max_files } => *max_files,
+            LogRotation::Hourly { max_files } => *max_files,
+            LogRotation::Daily { max_files } => *max_files,
+            LogRotation::Weekly { max_files } => *max_files,
+        }
+    }
+
+    #[inline]
+    pub fn is_never(&self) -> bool {
+        matches!(self, LogRotation::Never)
+    }
+}
+
+impl Default for LogConfig {
+    fn default() -> LogConfig {
+        LogConfig {
+            level: default_level(),
+            file: None,
+            rotation: LogRotation::Never,
+        }
+    }
+}
+
+/// Default log level
+fn default_level() -> String {
+    "info".to_string()
+}
+
+/// Plugin configuration entry
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginConfig {
+    /// Unique identifier for this plugin instance
+    pub tag: String,
+
+    /// Plugin type (e.g., "udp_server", "forward")
+    #[serde(rename = "type")]
+    pub plugin_type: String,
+
+    /// Plugin-specific arguments (parsed by plugin factory)
+    pub args: Option<Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct PluginTagCase {
+        tag: String,
+        error: Option<String>,
+    }
+
+    fn plugin(tag: &str, plugin_type: &str) -> PluginConfig {
+        PluginConfig {
+            tag: tag.to_string(),
+            plugin_type: plugin_type.to_string(),
+            args: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_plugin_tags() {
+        let config = Config {
+            include: Vec::new(),
+            runtime: RuntimeConfig::default(),
+            api: ApiConfig::default(),
+            log: LogConfig::default(),
+            network: NetworkConfig::default(),
+            plugins: vec![plugin("dup", "debug_print"), plugin("dup", "ttl")],
+        };
+
+        let err = config
+            .validate()
+            .expect_err("should reject duplicate plugin tags");
+        assert!(matches!(err, ConfigError::DuplicatePluginTag { .. }));
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_plugin_type() {
+        let config = Config {
+            include: Vec::new(),
+            runtime: RuntimeConfig::default(),
+            api: ApiConfig::default(),
+            log: LogConfig::default(),
+            network: NetworkConfig::default(),
+            plugins: vec![plugin("test", "")],
+        };
+
+        let err = config
+            .validate()
+            .expect_err("should reject empty plugin type");
+        assert!(matches!(err, ConfigError::EmptyPluginType));
+    }
+
+    #[test]
+    fn test_plugin_tag_validation_matches_shared_cases() {
+        let cases: Vec<PluginTagCase> =
+            serde_json::from_str(include_str!("../../tests/fixtures/plugin_tag_cases.json"))
+                .expect("shared plugin tag cases should parse");
+
+        for case in cases {
+            let actual = validate_plugin_tag(&case.tag)
+                .err()
+                .map(plugin_tag_error_code);
+            assert_eq!(actual, case.error.as_deref(), "{:?}", case.tag);
+            assert_eq!(is_valid_plugin_tag(&case.tag), case.error.is_none());
+        }
+    }
+
+    fn plugin_tag_error_code(error: PluginTagValidationError) -> &'static str {
+        match error {
+            PluginTagValidationError::Empty => "empty",
+            PluginTagValidationError::TooLong => "too_long",
+            PluginTagValidationError::NonAscii => "non_ascii",
+            PluginTagValidationError::InvalidCharacter(_) => "invalid_character",
+            PluginTagValidationError::EmptySegment => "empty_segment",
+            PluginTagValidationError::InvalidSegmentBoundary(_) => "invalid_segment_boundary",
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_plugin_tags() {
+        for tag in [
+            "has space",
+            "中文",
+            "tag/slash",
+            "tag:colon",
+            "tag%20",
+            ".",
+            "..",
+            "cache..cn",
+            "_cache",
+        ] {
+            let config = Config {
+                include: Vec::new(),
+                runtime: RuntimeConfig::default(),
+                api: ApiConfig::default(),
+                log: LogConfig::default(),
+                network: NetworkConfig::default(),
+                plugins: vec![plugin(tag, "debug_print")],
+            };
+
+            let err = config
+                .validate()
+                .expect_err("should reject invalid plugin tag");
+            assert!(matches!(err, ConfigError::InvalidPluginTag { .. }));
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_reserved_quick_setup_plugin_tags() {
+        for tag in [
+            "qs.exec.seq.0.cache",
+            "qs.match.seq.0.0.qname",
+            "qs.cron.cron.0.0.cache",
+        ] {
+            let config = Config {
+                include: Vec::new(),
+                runtime: RuntimeConfig::default(),
+                api: ApiConfig::default(),
+                log: LogConfig::default(),
+                network: NetworkConfig::default(),
+                plugins: vec![plugin(tag, "debug_print")],
+            };
+
+            let err = config
+                .validate()
+                .expect_err("should reject reserved quick-setup tag prefix");
+            assert!(matches!(err, ConfigError::ReservedPluginTagPrefix(_)));
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_basic_valid_config() {
+        let config = Config {
+            include: Vec::new(),
+            runtime: RuntimeConfig::default(),
+            api: ApiConfig::default(),
+            log: LogConfig::default(),
+            network: NetworkConfig::default(),
+            plugins: vec![plugin("ok", "debug_print")],
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_runtime_worker_threads() {
+        let config = Config {
+            include: Vec::new(),
+            runtime: RuntimeConfig {
+                worker_threads: Some(0),
+            },
+            api: ApiConfig::default(),
+            log: LogConfig::default(),
+            network: NetworkConfig::default(),
+            plugins: vec![plugin("ok", "debug_print")],
+        };
+
+        let err = config
+            .validate()
+            .expect_err("should reject zero runtime worker threads");
+        assert!(matches!(err, ConfigError::InvalidRuntimeWorkerThreads));
+    }
+
+    #[test]
+    fn test_runtime_worker_threads_default_to_available_parallelism() {
+        let expected = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+
+        assert_eq!(
+            RuntimeConfig::default().effective_worker_threads(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_api_http_string_shorthand() {
+        let config = Config {
+            include: Vec::new(),
+            runtime: RuntimeConfig::default(),
+            api: ApiConfig {
+                http: Some(ApiHttpConfig::Listen("0.0.0.0:8080".to_string())),
+            },
+            log: LogConfig::default(),
+            network: NetworkConfig::default(),
+            plugins: vec![plugin("ok", "debug_print")],
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_api_mtls_without_client_ca() {
+        let config = Config {
+            include: Vec::new(),
+            runtime: RuntimeConfig::default(),
+            api: ApiConfig {
+                http: Some(ApiHttpConfig::Detailed(Box::new(ApiHttpDetailedConfig {
+                    listen: "127.0.0.1:9443".to_string(),
+                    ssl: Some(ApiTlsConfig {
+                        cert: Some("cert.pem".to_string()),
+                        key: Some("key.pem".to_string()),
+                        client_ca: None,
+                        require_client_cert: Some(true),
+                    }),
+                    auth: None,
+                    cors: None,
+                    webui: None,
+                }))),
+            },
+            log: LogConfig::default(),
+            network: NetworkConfig::default(),
+            plugins: vec![plugin("ok", "debug_print")],
+        };
+
+        let err = config
+            .validate()
+            .expect_err("should reject mtls config without client_ca");
+        assert!(matches!(err, ConfigError::MissingApiTlsClientCa));
+    }
+
+    #[test]
+    fn test_validate_accepts_network_outbound_profile() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    default: remote
+    profiles:
+      remote:
+        resolver:
+          nameservers:
+            - addr: 1.1.1.1:53
+            - addr: 8.8.8.8:53
+          ip_version: 4
+        proxy:
+          socks5: 127.0.0.1:1080
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_padded_default_outbound_profile() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    default: " remote "
+    profiles:
+      remote:
+        resolver: system
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("padded outbound default profile should fail");
+        assert!(matches!(err, ConfigError::InvalidNetworkOutbound(_)));
+    }
+
+    #[test]
+    fn test_validate_rejects_padded_outbound_profile_name() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      " remote ":
+        resolver: system
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("padded outbound profile name should fail");
+        assert!(matches!(err, ConfigError::InvalidNetworkOutbound(_)));
+    }
+
+    #[test]
+    fn test_validate_rejects_profile_resolver_proxy_without_socks5() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        resolver:
+          nameservers:
+            - addr: tcp://1.1.1.1:53
+          proxy: profile
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("profile resolver proxy without socks5 should fail");
+        assert!(matches!(err, ConfigError::InvalidNetworkOutbound(_)));
+    }
+
+    #[test]
+    fn test_validate_accepts_bracketed_ipv6_outbound_nameserver() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        resolver:
+          nameservers:
+            - addr: udp://[2001:4860:4860::8888]:53
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_unbracketed_ipv6_outbound_nameserver() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        resolver:
+          nameservers:
+            - addr: udp://2001:4860:4860::8888:53
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("unbracketed IPv6 nameserver should fail");
+        assert!(matches!(err, ConfigError::InvalidNetworkOutbound(_)));
+    }
+
+    #[test]
+    fn test_validate_rejects_outbound_resolver_bootstrap() {
+        let err = serde_yaml_ng::from_str::<Config>(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        resolver:
+          bootstrap:
+            - 1.1.1.1:53
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect_err("outbound resolver.bootstrap should not deserialize");
+
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_validate_rejects_domain_nameserver_without_dial_addr() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        resolver:
+          nameservers:
+            - addr: tls://dns.google:853
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("domain nameserver without dial_addr should fail");
+        assert!(matches!(err, ConfigError::InvalidNetworkOutbound(_)));
+    }
+
+    #[test]
+    fn test_validate_rejects_profile_proxy_with_doq_nameserver() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        resolver:
+          nameservers:
+            - addr: doq://94.140.14.14:853
+          proxy: profile
+        proxy:
+          socks5: 127.0.0.1:1080
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("DoQ nameserver cannot use profile proxy");
+        assert!(matches!(err, ConfigError::InvalidNetworkOutbound(_)));
+    }
+
+    #[test]
+    fn test_validate_rejects_unsupported_outbound_nameserver_scheme() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        resolver:
+          nameservers:
+            - addr: ftp://1.1.1.1:53
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("unsupported nameserver scheme should fail");
+        assert!(matches!(err, ConfigError::InvalidNetworkOutbound(_)));
+    }
+
+    #[cfg(not(feature = "resolver-dot"))]
+    #[test]
+    fn test_validate_rejects_feature_disabled_dot_nameserver() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        resolver:
+          nameservers:
+            - addr: tls://1.1.1.1:853
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("DoT nameserver should require resolver-dot");
+        assert!(err.to_string().contains("resolver-dot"), "{err}");
+    }
+
+    #[cfg(not(feature = "resolver-doh"))]
+    #[test]
+    fn test_validate_rejects_feature_disabled_doh_nameserver() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        resolver:
+          nameservers:
+            - addr: https://1.1.1.1/dns-query
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("DoH nameserver should require resolver-doh");
+        assert!(err.to_string().contains("resolver-doh"), "{err}");
+    }
+
+    #[cfg(not(feature = "resolver-doq"))]
+    #[test]
+    fn test_validate_rejects_feature_disabled_doq_nameserver() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        resolver:
+          nameservers:
+            - addr: doq://94.140.14.14:853
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("DoQ nameserver should require resolver-doq");
+        assert!(err.to_string().contains("resolver-doq"), "{err}");
+    }
+
+    #[cfg(not(feature = "resolver-doh3"))]
+    #[test]
+    fn test_validate_rejects_feature_disabled_doh3_nameserver() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        resolver:
+          nameservers:
+            - addr: h3://1.1.1.1/dns-query
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("DoH3 nameserver should require resolver-doh3");
+        assert!(err.to_string().contains("resolver-doh3"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_outbound_resolver_timeout() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        resolver:
+          nameservers:
+            - addr: 1.1.1.1:53
+          timeout: nope
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("invalid resolver timeout should fail");
+        assert!(matches!(err, ConfigError::InvalidNetworkOutbound(_)));
+    }
+
+    #[test]
+    fn test_validate_accepts_hostname_socks5_outbound_proxy_syntax() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        proxy:
+          socks5: user:pass@proxy.example.com:1080
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_socks5_outbound_proxy() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    profiles:
+      remote:
+        proxy:
+          socks5: 127.0.0.1
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("malformed socks5 proxy should fail validation");
+        assert!(matches!(err, ConfigError::InvalidNetworkOutbound(_)));
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_default_outbound_profile() {
+        let config: Config = serde_yaml_ng::from_str(
+            r#"
+network:
+  outbound:
+    default: missing
+plugins:
+  - tag: ok
+    type: debug_print
+"#,
+        )
+        .expect("config should deserialize");
+
+        let err = config
+            .validate()
+            .expect_err("missing outbound default profile should fail");
+        assert!(matches!(err, ConfigError::InvalidNetworkOutbound(_)));
+    }
+
+    #[test]
+    fn test_log_rotation_deserializes_minutely() {
+        #[derive(Debug, Deserialize)]
+        struct Wrapper {
+            rotation: LogRotation,
+        }
+
+        let config: Wrapper = serde_yaml_ng::from_str(
+            r#"
+rotation:
+  type: minutely
+  max_files: 7
+"#,
+        )
+        .expect("parse minutely rotation");
+
+        match config.rotation {
+            LogRotation::Minutely { max_files } => assert_eq!(max_files, Some(7)),
+            other => panic!("unexpected rotation: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_log_rotation_deserializes_weekly() {
+        #[derive(Debug, Deserialize)]
+        struct Wrapper {
+            rotation: LogRotation,
+        }
+
+        let config: Wrapper = serde_yaml_ng::from_str(
+            r#"
+rotation:
+  type: weekly
+  max_files: 4
+"#,
+        )
+        .expect("parse weekly rotation");
+
+        match config.rotation {
+            LogRotation::Weekly { max_files } => assert_eq!(max_files, Some(4)),
+            other => panic!("unexpected rotation: {other:?}"),
+        }
+    }
+}

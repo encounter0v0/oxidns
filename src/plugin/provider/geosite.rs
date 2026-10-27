@@ -1,0 +1,258 @@
+// SPDX-FileCopyrightText: 2025 Sven Shi
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! V2Ray geosite.dat-backed domain provider.
+
+use std::any::Any;
+use std::path::Path;
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use serde::Deserialize;
+use tracing::info;
+
+use crate::config::types::PluginConfig;
+use crate::core::rule_matcher::{DomainRuleKind, DomainRuleMatcher};
+use crate::infra::clock::AppClock;
+use crate::infra::error::{DnsError, Result as DnsResult};
+use crate::infra::task::spawn_isolated_build;
+use crate::plugin::provider::Provider;
+use crate::plugin::provider::v2ray::{
+    DatFileSession, Domain, DomainType, GeoSite, geosite_code, geosite_domain_matches_selectors,
+    matched_geosite_selectors, parse_geosite_selectors,
+};
+use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
+use crate::plugin_factory;
+use crate::proto::{Name, Question};
+
+#[derive(Debug, Clone, Deserialize)]
+struct GeoSiteArgs {
+    file: String,
+    #[serde(default)]
+    selectors: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct GeoSiteSnapshot {
+    matcher: DomainRuleMatcher,
+}
+
+#[derive(Debug)]
+pub struct GeoSiteProvider {
+    tag: String,
+    args: Arc<GeoSiteArgs>,
+    snapshot: ArcSwap<GeoSiteSnapshot>,
+}
+
+impl GeoSiteProvider {
+    fn build_snapshot(tag: &str, args: &GeoSiteArgs) -> DnsResult<GeoSiteSnapshot> {
+        let start_ms = AppClock::elapsed_millis();
+        let selectors = parse_geosite_selectors(&args.selectors).map_err(|e| {
+            DnsError::plugin(format!(
+                "plugin '{}' failed to parse geosite selectors: {}",
+                tag, e
+            ))
+        })?;
+        let path = Path::new(&args.file);
+        let mut source =
+            DatFileSession::open(path).map_err(|error| geosite_file_error(tag, args, error))?;
+        let mut matched_entries = 0usize;
+        let mut matched_domains = 0usize;
+        let mut full = 0usize;
+        let mut keyword = 0usize;
+        let mut regexp = 0usize;
+        source
+            .visit_geosite(|entry| {
+                visit_selected_geosite_domains(&entry, &selectors, |domain| {
+                    match geosite_domain_kind(domain)? {
+                        DomainRuleKind::Full => full += 1,
+                        DomainRuleKind::Keyword => keyword += 1,
+                        DomainRuleKind::Regexp => regexp += 1,
+                        DomainRuleKind::Domain => {}
+                    }
+                    matched_domains += 1;
+                    Ok(())
+                })
+                .map(|matched| matched_entries += usize::from(matched))
+            })
+            .map_err(|error| geosite_file_error(tag, args, error))?;
+        let mut matcher = DomainRuleMatcher::default();
+        matcher.reserve_rules(full, keyword, regexp);
+        source
+            .visit_geosite(|entry| {
+                visit_selected_geosite_domains(&entry, &selectors, |domain| {
+                    let kind = geosite_domain_kind(domain)?;
+                    matcher
+                        .add_rule(kind, &domain.value, "")
+                        .map_err(|error| format!("geosite code '{}' {error}", geosite_code(&entry)))
+                })?;
+                Ok(())
+            })
+            .map_err(|error| geosite_file_error(tag, args, error))?;
+
+        if matched_entries == 0 && !selectors.is_empty() {
+            return Err(DnsError::plugin(format!(
+                "plugin '{}' found no geosite entries in '{}' for selectors {:?}",
+                tag, args.file, args.selectors
+            )));
+        }
+
+        if matched_domains == 0 && !selectors.is_empty() {
+            return Err(DnsError::plugin(format!(
+                "plugin '{}' found no geosite rules in '{}' for selectors {:?}",
+                tag, args.file, args.selectors
+            )));
+        }
+
+        matcher.finalize().map_err(DnsError::plugin)?;
+        let has_rules = matcher.full_rule_count()
+            + matcher.trie_rule_count()
+            + matcher.keyword_rule_count()
+            + matcher.regexp_rule_count();
+        if has_rules == 0 {
+            return Err(DnsError::plugin(format!(
+                "plugin '{}' produced no domain rules from geosite dat '{}'",
+                tag, args.file
+            )));
+        }
+
+        let elapsed_ms = AppClock::elapsed_millis().saturating_sub(start_ms);
+        info!(
+            tag = %tag,
+            file = %args.file,
+            selectors = ?args.selectors,
+            matched_entries,
+            matched_domains,
+            full_rules = matcher.full_rule_count(),
+            domain_rules = matcher.trie_rule_count(),
+            keyword_rules = matcher.keyword_rule_count(),
+            regex_rules = matcher.regexp_rule_count(),
+            elapsed_ms,
+            "geosite snapshot built"
+        );
+
+        Ok(GeoSiteSnapshot { matcher })
+    }
+}
+
+#[async_trait]
+impl Plugin for GeoSiteProvider {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    async fn init(&mut self, _context: &crate::plugin::PluginInitContext<'_>) -> DnsResult<()> {
+        self.reload().await
+    }
+
+    async fn destroy(&self) -> DnsResult<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Provider for GeoSiteProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    #[hotpath::measure]
+    fn contains_name(&self, name: &Name) -> bool {
+        self.snapshot.load().matcher.is_match_name(name)
+    }
+
+    #[hotpath::measure]
+    fn contains_question(&self, question: &Question) -> bool {
+        self.contains_name(question.name())
+    }
+
+    #[hotpath::measure]
+    async fn reload(&self) -> DnsResult<()> {
+        let tag = self.tag.clone();
+        let args = self.args.clone();
+        let snapshot = spawn_isolated_build("geosite snapshot build", move || {
+            Self::build_snapshot(&tag, &args)
+        })
+        .await?;
+        self.snapshot.store(Arc::new(snapshot));
+        Ok(())
+    }
+
+    fn supports_domain_matching(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone)]
+#[plugin_factory("geosite")]
+pub struct GeoSiteFactory;
+
+impl PluginFactory for GeoSiteFactory {
+    fn create(
+        &self,
+        plugin_config: &PluginConfig,
+        _init_context: &crate::plugin::PluginInitContext<'_>,
+    ) -> DnsResult<UninitializedPlugin> {
+        let args = plugin_config
+            .args
+            .clone()
+            .ok_or_else(|| DnsError::plugin("geosite provider requires args"))?;
+        let args = serde_yaml_ng::from_value::<GeoSiteArgs>(args)
+            .map_err(|e| DnsError::plugin(format!("failed to parse geosite config: {}", e)))?;
+
+        if args.file.trim().is_empty() {
+            return Err(DnsError::plugin(format!(
+                "plugin '{}' geosite args.file must not be empty",
+                plugin_config.tag
+            )));
+        }
+
+        Ok(UninitializedPlugin::Provider(Box::new(GeoSiteProvider {
+            tag: plugin_config.tag.clone(),
+            args: Arc::new(args),
+            snapshot: ArcSwap::from_pointee(GeoSiteSnapshot::default()),
+        })))
+    }
+}
+
+fn visit_selected_geosite_domains<F>(
+    entry: &GeoSite,
+    selectors: &[crate::plugin::provider::v2ray::GeoSiteSelector],
+    mut on_domain: F,
+) -> Result<bool, String>
+where
+    F: FnMut(&Domain) -> Result<(), String>,
+{
+    let matched_selectors = matched_geosite_selectors(entry, selectors);
+    if !selectors.is_empty() && matched_selectors.is_empty() {
+        return Ok(false);
+    }
+    for domain in &entry.domain {
+        if selectors.is_empty() || geosite_domain_matches_selectors(domain, &matched_selectors) {
+            on_domain(domain)?;
+        }
+    }
+    Ok(true)
+}
+
+fn geosite_domain_kind(domain: &Domain) -> Result<DomainRuleKind, String> {
+    match DomainType::try_from(domain.r#type).map_err(|_| {
+        format!(
+            "unsupported domain type '{}' for '{}'",
+            domain.r#type, domain.value
+        )
+    })? {
+        DomainType::Plain => Ok(DomainRuleKind::Keyword),
+        DomainType::Regex => Ok(DomainRuleKind::Regexp),
+        DomainType::RootDomain => Ok(DomainRuleKind::Domain),
+        DomainType::Full => Ok(DomainRuleKind::Full),
+    }
+}
+
+fn geosite_file_error(tag: &str, args: &GeoSiteArgs, error: String) -> DnsError {
+    DnsError::plugin(format!(
+        "plugin '{}' failed to stream geosite dat file '{}': {}",
+        tag, args.file, error
+    ))
+}

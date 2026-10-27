@@ -1,0 +1,40 @@
+// SPDX-FileCopyrightText: 2025 Sven Shi
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! DNS transport helpers for stream and socket oriented protocols.
+//!
+//! This module provides minimal, dependency-light helpers that convert between
+//! OxiDNS `Message` and wire bytes, and perform framed I/O for stream-based
+//! transports (length-prefixed), as well as QUIC stream helpers.
+//!
+//! It is intentionally lower level than server and upstream plugins:
+//!
+//! - [`udp`] handles datagram-oriented message I/O;
+//! - [`tcp`] handles length-prefixed DNS over TCP / TLS framing; and
+//! - [`quic`] handles stream-based DNS over QUIC helpers.
+//!
+//! Keeping these helpers small makes the protocol plugins easier to review and
+//! reduces duplication at transport boundaries.
+#[cfg(any(feature = "server-doq", feature = "_dns-client-doq"))]
+pub mod quic;
+pub mod tcp;
+pub mod udp;
+
+#[cfg(any(feature = "server-doq", feature = "_dns-client-doq"))]
+#[deprecated(note = "use transport::quic instead")]
+#[doc(hidden)]
+pub mod quic_transport {
+    pub use super::quic::*;
+}
+
+#[deprecated(note = "use transport::tcp instead")]
+#[doc(hidden)]
+pub mod tcp_transport {
+    pub use super::tcp::*;
+}
+
+#[deprecated(note = "use transport::udp instead")]
+#[doc(hidden)]
+pub mod udp_transport {
+    pub use super::udp::*;
+}

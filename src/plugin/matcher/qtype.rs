@@ -1,0 +1,155 @@
+// SPDX-FileCopyrightText: 2025 Sven Shi
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! `qtype` matcher plugin.
+//!
+//! This plugin follows standard plugin lifecycle (`init/destroy`) and
+//! matches DNS question types in request queries.
+
+use std::fmt::Debug;
+
+use ahash::AHashSet;
+use async_trait::async_trait;
+
+use crate::config::types::PluginConfig;
+use crate::core::context::DnsContext;
+use crate::infra::error::Result as DnsResult;
+use crate::plugin::matcher::Matcher;
+use crate::plugin::matcher::rules::{
+    parse_enum_rules_from_value, parse_quick_setup_rules, parse_u16_rules, validate_non_empty_rules,
+};
+use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
+use crate::plugin_factory;
+use crate::proto::RecordType;
+
+#[derive(Debug, Clone)]
+#[plugin_factory("qtype")]
+pub struct QtypeFactory {}
+
+impl PluginFactory for QtypeFactory {
+    fn create(
+        &self,
+        plugin_config: &PluginConfig,
+        _init_context: &crate::plugin::PluginInitContext<'_>,
+    ) -> DnsResult<UninitializedPlugin> {
+        let rules = parse_enum_rules_from_value("qtype", plugin_config.args.clone())?;
+        build_qtype_matcher(plugin_config.tag.clone(), rules)
+    }
+
+    fn quick_setup(&self, tag: &str, param: Option<String>) -> DnsResult<UninitializedPlugin> {
+        let rules = parse_quick_setup_rules(param)?;
+        build_qtype_matcher(tag.to_string(), rules)
+    }
+}
+
+fn build_qtype_matcher(tag: String, rules: Vec<String>) -> DnsResult<UninitializedPlugin> {
+    validate_non_empty_rules("qtype", &rules)?;
+    let qtypes = parse_u16_rules("qtype", &rules, |raw| {
+        RecordType::from_token(raw).map(u16::from)
+    })?;
+    Ok(UninitializedPlugin::Matcher(Box::new(QtypeMatcher {
+        tag,
+        qtypes,
+    })))
+}
+
+#[derive(Debug)]
+struct QtypeMatcher {
+    tag: String,
+    qtypes: AHashSet<u16>,
+}
+
+#[async_trait]
+impl Plugin for QtypeMatcher {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    async fn init(&mut self, _context: &crate::plugin::PluginInitContext<'_>) -> DnsResult<()> {
+        Ok(())
+    }
+
+    async fn destroy(&self) -> DnsResult<()> {
+        Ok(())
+    }
+}
+
+impl Matcher for QtypeMatcher {
+    #[hotpath::measure]
+    fn is_match(&self, context: &mut DnsContext) -> bool {
+        context
+            .request
+            .questions()
+            .iter()
+            .any(|q| self.qtypes.contains(&u16::from(q.qtype())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::*;
+    use crate::core::context::DnsContext;
+    use crate::plugin::matcher::Matcher;
+    use crate::proto::{DNSClass, Message, Name, Question, RecordType};
+
+    fn make_context(qtypes: &[RecordType]) -> DnsContext {
+        let mut request = Message::new();
+        for qtype in qtypes {
+            let mut query = Question::new(
+                Name::from_ascii("example.com.").unwrap(),
+                *qtype,
+                DNSClass::IN,
+            );
+            query.set_qclass(DNSClass::IN);
+            request.add_question(query);
+        }
+
+        DnsContext::new(SocketAddr::new("127.0.0.1".parse().unwrap(), 5353), request)
+    }
+
+    #[tokio::test]
+    async fn test_qtype_matcher_only_checks_qtype() {
+        let matcher = QtypeMatcher {
+            tag: "qtype".into(),
+            qtypes: [u16::from(RecordType::AAAA)].into_iter().collect(),
+        };
+        let mut ctx = make_context(&[RecordType::A]);
+        assert!(!matcher.is_match(&mut ctx));
+    }
+
+    #[test]
+    fn test_build_qtype_matcher_rejects_empty_rules() {
+        assert!(build_qtype_matcher("qtype".to_string(), vec![]).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_build_qtype_matcher_accepts_text_rules() {
+        let matcher = match build_qtype_matcher(
+            "qtype".to_string(),
+            vec!["A".to_string(), "aaaa".to_string()],
+        )
+        .expect("text qtype rules should build")
+        {
+            UninitializedPlugin::Matcher(matcher) => matcher,
+            _ => unreachable!("qtype factory should create a matcher"),
+        };
+
+        let mut a_ctx = make_context(&[RecordType::A]);
+        assert!(matcher.is_match(&mut a_ctx));
+
+        let mut aaaa_ctx = make_context(&[RecordType::AAAA]);
+        assert!(matcher.is_match(&mut aaaa_ctx));
+    }
+
+    #[tokio::test]
+    async fn test_qtype_matcher_matches_when_any_query_type_matches() {
+        let matcher = QtypeMatcher {
+            tag: "qtype".into(),
+            qtypes: [u16::from(RecordType::AAAA)].into_iter().collect(),
+        };
+        let mut ctx = make_context(&[RecordType::A, RecordType::AAAA]);
+        assert!(matcher.is_match(&mut ctx));
+    }
+}

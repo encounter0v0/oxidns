@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+cargo +nightly fmt --all --check
+cargo +nightly clippy --all-features -- -D warnings

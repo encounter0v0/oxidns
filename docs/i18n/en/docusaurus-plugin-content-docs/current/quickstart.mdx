@@ -1,0 +1,135 @@
+---
+title: Quick Start
+sidebar_position: 2
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+import Admonition from '@theme/Admonition';
+
+This page has one goal: install OxiDNS and complete the first successful DNS query. Use the dedicated installation guides for version selection, portable mode, uninstallation, and production deployment details.
+
+## Choose an installation path
+
+| Environment | Recommended guide |
+| --- | --- |
+| Linux / macOS / Windows host | [Native installer](installation/native.mdx) |
+| Docker / Compose | [Docker deployment](installation/docker.mdx) |
+| OpenWrt router | [OpenWrt and LuCI](openwrt.mdx) |
+| Manual archive, Debian package, or source | [Releases, Debian, and source installation](installation/packages.mdx) |
+| Custom plugin and protocol selection | [Custom Builds](custom-build.mdx) |
+
+## 1. Install
+
+<Tabs groupId="quickstart-platform">
+  <TabItem value="unix" label="Linux / macOS" default>
+
+```bash
+curl -fsSL https://oxidns.org/install.sh | sudo sh
+```
+
+  </TabItem>
+  <TabItem value="windows" label="Windows">
+
+Run in an administrator PowerShell session:
+
+```powershell
+irm https://oxidns.org/install.ps1 | iex
+```
+
+  </TabItem>
+  <TabItem value="docker" label="Docker">
+
+Prepare the configuration:
+
+```bash
+mkdir -p oxidns && cd oxidns
+docker run --rm --entrypoint /bin/cat \
+  svenshi/oxidns:latest /etc/oxidns/config.yaml > config.yaml
+```
+
+Then start the container:
+
+```bash
+docker run -d --name oxidns --restart unless-stopped \
+  -p 53:53/udp -p 53:53/tcp -p 127.0.0.1:9199:9199/tcp \
+  -v "$(pwd)/config.yaml:/etc/oxidns/config.yaml:ro" \
+  svenshi/oxidns:latest
+```
+
+  </TabItem>
+  <TabItem value="openwrt" label="OpenWrt">
+
+```sh
+curl -fsSL https://oxidns.org/install.sh | sh
+```
+
+If `curl` is unavailable, use `wget -O- https://oxidns.org/install.sh | sh`.
+
+  </TabItem>
+</Tabs>
+
+<Admonition type="note" title="OpenWrt also needs the core">
+
+The OpenWrt script installs only `luci-app-oxidns`. After it finishes, open `Services → OxiDNS → Core` to install and start the OxiDNS core, then continue with verification.
+
+</Admonition>
+
+## 2. Verify
+
+<Tabs groupId="quickstart-platform">
+  <TabItem value="unix" label="Linux / macOS" default>
+
+```bash
+oxidns --version
+oxidns build-info
+curl -fsS http://127.0.0.1:9199/api/readyz
+dig @127.0.0.1 example.com
+```
+
+  </TabItem>
+  <TabItem value="windows" label="Windows">
+
+```powershell
+oxidns.exe --version
+oxidns.exe build-info
+Invoke-RestMethod http://127.0.0.1:9199/api/readyz
+Resolve-DnsName example.com -Server 127.0.0.1
+```
+
+  </TabItem>
+  <TabItem value="docker" label="Docker">
+
+```bash
+docker ps --filter name=oxidns
+docker logs --tail 50 oxidns
+curl -fsS http://127.0.0.1:9199/api/readyz
+dig @127.0.0.1 example.com
+```
+
+  </TabItem>
+  <TabItem value="openwrt" label="OpenWrt">
+
+Confirm that the core is running on the LuCI status page, then query from the router shell or a LAN device:
+
+```sh
+nslookup example.com 127.0.0.1
+```
+
+  </TabItem>
+</Tabs>
+
+The first start is successful when all of these are true:
+
+- version and `build-info` output normally;
+- `/api/readyz` succeeds, or LuCI reports the core as running;
+- the DNS query returns a valid result.
+
+The default WebUI address is `http://SERVER_IP:9199/`. If readiness works but DNS does not, follow [Operations and Troubleshooting](operations.md) to inspect listeners, configuration, and upstreams. Enable authentication and read [Security Hardening](security.md) before allowing other devices to reach the WebUI or API.
+
+## 3. Next steps
+
+- Choose a home, router, or server template from [Scenarios](scenarios.md).
+- Read the [Configuration Guide](configuration.md) to understand plugins and the execution chain.
+- Find specific capabilities and options in the [Plugin Reference](plugin-reference/overview.md).
+- Complete the deployment checks in [Operations and Troubleshooting](operations.md) before production use.

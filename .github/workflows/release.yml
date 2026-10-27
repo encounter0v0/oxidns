@@ -1,0 +1,522 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag Version (e.g. v1.6.1)'
+        required: false
+        default: 'v1.6.1'
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  webui:
+    name: Build WebUI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: webui/pnpm-lock.yaml
+
+      - name: Install WebUI dependencies
+        working-directory: webui
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck WebUI
+        working-directory: webui
+        run: pnpm typecheck
+
+      - name: Build WebUI
+        working-directory: webui
+        run: pnpm build
+
+      - name: Upload WebUI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: webui-dist
+          path: webui/out
+          if-no-files-found: error
+
+  release:
+    name: Build full ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: webui
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            exe: oxidns
+            archive_ext: tar.gz
+            build_tool: cargo
+            make_deb: true
+            upx_kind: linux
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            exe: oxidns
+            archive_ext: tar.gz
+            build_tool: cross
+            make_deb: false
+            upx_kind: linux
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            exe: oxidns
+            archive_ext: tar.gz
+            build_tool: cross
+            make_deb: true
+            upx_kind: linux
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            exe: oxidns
+            archive_ext: tar.gz
+            build_tool: cross
+            make_deb: false
+            upx_kind: linux
+
+          - os: ubuntu-latest
+            target: i686-unknown-linux-musl
+            exe: oxidns
+            archive_ext: tar.gz
+            build_tool: cross
+            make_deb: false
+            upx_kind: linux
+
+          - os: ubuntu-latest
+            target: arm-unknown-linux-musleabihf
+            exe: oxidns
+            archive_ext: tar.gz
+            build_tool: cross
+            make_deb: false
+            upx_kind: linux
+
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            exe: oxidns
+            archive_ext: tar.gz
+            build_tool: cross
+            make_deb: false
+            upx_kind: linux
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            exe: oxidns
+            archive_ext: tar.gz
+            build_tool: cargo
+            make_deb: false
+            upx_kind: none
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            exe: oxidns
+            archive_ext: tar.gz
+            build_tool: cargo
+            make_deb: false
+            upx_kind: none
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-freebsd
+            exe: oxidns
+            archive_ext: tar.gz
+            build_tool: cross
+            make_deb: false
+            upx_kind: none
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: oxidns.exe
+            archive_ext: zip
+            build_tool: cargo
+            make_deb: false
+            upx_kind: windows
+
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            exe: oxidns.exe
+            archive_ext: zip
+            build_tool: cargo
+            make_deb: false
+            upx_kind: windows
+
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            exe: oxidns.exe
+            archive_ext: zip
+            build_tool: cargo
+            make_deb: false
+            upx_kind: none
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The automatic key describes the host toolchain, not the cross target.
+          key: ${{ matrix.target }}-full
+
+      - name: Download WebUI artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: webui-dist
+          path: webui/out
+
+      - name: Install cross
+        if: matrix.build_tool == 'cross'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install cross toolchain for aarch64 GNU
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Install cargo-deb
+        if: matrix.make_deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build release binary with cargo
+        if: matrix.build_tool == 'cargo'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "${{ matrix.target }}" --no-default-features --features full
+
+      - name: Build release binary with cross
+        if: matrix.build_tool == 'cross'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cross build --locked --release --target "${{ matrix.target }}" --no-default-features --features full
+
+      # Build .deb BEFORE UPX so cargo-deb strips the original binary, not a packed one.
+      - name: Generate deb for target
+        if: matrix.make_deb
+        run: cargo deb --no-build --target ${{ matrix.target }}
+
+      - name: Find deb artifacts
+        if: matrix.make_deb
+        run: |
+          echo 'Listing created .deb artifacts:'
+          find target -type f -name "*.deb" -print
+
+      - name: Upload built .deb artifacts
+        if: matrix.make_deb
+        uses: actions/upload-artifact@v7
+        with:
+          name: oxidns-${{ matrix.target }}.deb
+          path: target/debian/*.deb
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Run UPX (supported Linux targets only)
+        if: matrix.upx_kind == 'linux'
+        continue-on-error: true
+        uses: crazy-max/ghaction-upx@v4
+        with:
+          version: v5.0.2
+          files: |
+            target/${{ matrix.target }}/release/${{ matrix.exe }}
+          args: -q --best --lzma
+
+      - name: Run UPX (supported Windows targets only)
+        if: matrix.upx_kind == 'windows'
+        continue-on-error: true
+        uses: crazy-max/ghaction-upx@v4
+        with:
+          version: v5.0.2
+          files: |
+            target/${{ matrix.target }}/release/${{ matrix.exe }}
+          args: -q --best --lzma
+
+      - name: Package release (non-Windows)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          EXE="${{ matrix.exe }}"
+          DIR="target/${{ matrix.target }}/release"
+
+          ls -lah "$DIR"
+          cp config.yaml LICENSE "$DIR"/
+          rm -rf "$DIR/webui"
+          cp -R webui/out "$DIR/webui"
+          tar czf "$DIR/oxidns-${TARGET}.tar.gz" -C "$DIR" "$EXE" config.yaml LICENSE webui
+
+      - name: Package release (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $TARGET = '${{ matrix.target }}'
+          $EXE = '${{ matrix.exe }}'
+          $DIR = "target/${{ matrix.target }}/release"
+
+          Write-Output "Files in ${DIR}`n"
+          Get-ChildItem -Path $DIR | Write-Output
+
+          Copy-Item -Path "config.yaml" -Destination "$DIR/"
+          Copy-Item -Path "LICENSE" -Destination "$DIR/"
+          if (Test-Path "$DIR/webui") {
+            Remove-Item -Path "$DIR/webui" -Recurse -Force
+          }
+          Copy-Item -Path "webui/out" -Destination "$DIR/webui" -Recurse
+
+          Compress-Archive `
+            -Path "$DIR/$EXE", "$DIR/config.yaml", "$DIR/LICENSE", "$DIR/webui" `
+            -DestinationPath "$DIR/oxidns-$TARGET.zip" `
+            -Force
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: oxidns-${{ matrix.target }}.${{ matrix.archive_ext }}
+          path: target/${{ matrix.target }}/release/oxidns-${{ matrix.target }}.${{ matrix.archive_ext }}
+          compression-level: 0
+          if-no-files-found: error
+
+  slim-release:
+    name: Build ${{ matrix.bundle }} ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    needs: webui
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - bundle: minimal
+            target: x86_64-unknown-linux-musl
+          - bundle: minimal
+            target: aarch64-unknown-linux-musl
+          - bundle: standard
+            target: x86_64-unknown-linux-musl
+          - bundle: standard
+            target: aarch64-unknown-linux-musl
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Both target and feature bundle affect reusable dependency artifacts.
+          key: ${{ matrix.target }}-${{ matrix.bundle }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Download WebUI artifact
+        if: matrix.bundle == 'standard'
+        uses: actions/download-artifact@v8
+        with:
+          name: webui-dist
+          path: webui/out
+
+      - name: Build slim release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cross build \
+            --locked \
+            --release \
+            --target "${{ matrix.target }}" \
+            --no-default-features \
+            --features "${{ matrix.bundle }}"
+
+      - name: Run UPX
+        continue-on-error: true
+        uses: crazy-max/ghaction-upx@v4
+        with:
+          version: v5.0.2
+          files: target/${{ matrix.target }}/release/oxidns
+          args: -q --best --lzma
+
+      - name: Package slim release
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE="${{ matrix.bundle }}"
+          TARGET="${{ matrix.target }}"
+          DIR="target/${TARGET}/release"
+          ARCHIVE="oxidns-${BUNDLE}-${TARGET}.tar.gz"
+
+          ls -lah "$DIR"
+          cp LICENSE "$DIR"/
+          if [[ "$BUNDLE" == "standard" ]]; then
+            cp config.yaml "$DIR"/
+            rm -rf "$DIR/webui"
+            cp -R webui/out "$DIR/webui"
+            tar czf "$DIR/${ARCHIVE}" -C "$DIR" oxidns config.yaml LICENSE webui
+          else
+            # minimal: ship the dedicated minimal config (no api/webui block)
+            cp config.minimal.yaml "$DIR/config.yaml"
+            tar czf "$DIR/${ARCHIVE}" -C "$DIR" oxidns config.yaml LICENSE
+          fi
+
+      - name: Upload slim archive artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: oxidns-${{ matrix.bundle }}-${{ matrix.target }}.tar.gz
+          path: target/${{ matrix.target }}/release/oxidns-${{ matrix.bundle }}-${{ matrix.target }}.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [release, slim-release]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: oxidns-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: List artifacts
+        run: |
+          find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" -o -name "*.deb" \) | sort
+
+      - name: Prepare release notes
+        env:
+          INPUT_TAG: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.ref_name }}"
+          if [[ "$VERSION" == "main" || "$VERSION" == "master" ]]; then
+            VERSION="${INPUT_TAG:-v1.6.1}"
+          fi
+          RELEASE_NOTES_PATH=".github/release-notes.md"
+          if [[ ! -s "$RELEASE_NOTES_PATH" ]] || ! grep -q "^# OxiDNS ${VERSION}" "$RELEASE_NOTES_PATH"; then
+            echo "# OxiDNS ${VERSION}" > "$RELEASE_NOTES_PATH"
+            echo "" >> "$RELEASE_NOTES_PATH"
+            echo "## ✨ OxiDNS Modern Liquid Glass WebUI Release" >> "$RELEASE_NOTES_PATH"
+            echo "" >> "$RELEASE_NOTES_PATH"
+            echo "- DNS 监控总览大屏与实时解析吞吐监控" >> "$RELEASE_NOTES_PATH"
+            echo "- 现代简约液态玻璃 (Liquid Glass) 设计风格" >> "$RELEASE_NOTES_PATH"
+            echo "- 支持跟随系统切换明暗黑模式" >> "$RELEASE_NOTES_PATH"
+          fi
+          python3 -m unittest discover -s .github/scripts -p '*_test.py' || true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name != 'main' && github.ref_name != 'master' && github.ref_name || inputs.tag_name || 'v1.6.1' }}
+          files: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+            artifacts/*.deb
+          body_path: .github/release-notes.md
+          generate_release_notes: true
+          draft: false
+
+      - name: Notify Telegram
+        if: env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != ''
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          RELEASE_NOTES_PATH=".github/release-notes.md"
+          MESSAGE=$(python3 .github/scripts/telegram_release_message.py \
+            "$RELEASE_NOTES_PATH" "$RELEASE_URL")
+
+          SEND_RESPONSE=$(curl -sS --fail-with-body \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}" \
+            --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "disable_web_page_preview=false")
+          MESSAGE_ID=$(jq -er '.result.message_id' <<<"$SEND_RESPONSE")
+
+          PIN_RESPONSE=$(curl -sS --fail-with-body \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/pinChatMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "message_id=${MESSAGE_ID}" \
+            --data-urlencode "disable_notification=true")
+          jq -e '.ok == true and .result == true' >/dev/null <<<"$PIN_RESPONSE"
+
+  publish-support-crates:
+    name: Publish support crates to crates.io
+    if: startsWith(github.ref, 'refs/tags/') && secrets.CRATES_IO_API_TOKEN != ''
+    runs-on: ubuntu-latest
+    needs: publish
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish missing support-crate versions
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
+        run: bash .github/scripts/publish_support_crates.sh
+
+  publish-crate:
+    name: Publish to crates.io
+    if: startsWith(github.ref, 'refs/tags/') && secrets.CRATES_IO_API_TOKEN != ''
+    runs-on: ubuntu-latest
+    needs: publish-support-crates
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify package
+        run: cargo publish --locked --dry-run
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_API_TOKEN }}
+        run: cargo publish --locked
+
+  docker:
+    name: Publish Docker Images
+    if: (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') && secrets.DOCKERHUB_TOKEN != ''
+    needs: publish
+    uses: ./.github/workflows/docker.yml
+    with:
+      OXIDNS_VERSION: ${{ github.ref_name }}
+    secrets: inherit

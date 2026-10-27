@@ -1,0 +1,381 @@
+use std::hint::black_box;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use oxidns::config::types::{
+    ApiConfig, Config, LogConfig, NetworkConfig, PluginConfig, RuntimeConfig,
+};
+use oxidns::core::context::DnsContext;
+use oxidns::plugin::{PluginRegistry, init as init_plugins};
+use oxidns::proto::{DNSClass, Message, Name, Question, RecordType};
+use serde_yaml_ng::{Mapping, Value};
+use tokio::runtime::Runtime;
+
+fn runtime() -> Runtime {
+    Runtime::new().expect("benchmark tokio runtime should start")
+}
+
+fn plugin_config(tag: &str, plugin_type: &str, args: Value) -> PluginConfig {
+    PluginConfig {
+        tag: tag.to_string(),
+        plugin_type: plugin_type.to_string(),
+        args: Some(args),
+    }
+}
+
+fn hosts_args(entries: &[String]) -> Value {
+    let mut mapping = Mapping::new();
+    mapping.insert(
+        Value::String("entries".to_string()),
+        Value::Sequence(entries.iter().cloned().map(Value::String).collect()),
+    );
+    Value::Mapping(mapping)
+}
+
+fn redirect_args(rules: &[String]) -> Value {
+    let mut mapping = Mapping::new();
+    mapping.insert(
+        Value::String("rules".to_string()),
+        Value::Sequence(rules.iter().cloned().map(Value::String).collect()),
+    );
+    Value::Mapping(mapping)
+}
+
+fn make_config(plugin: PluginConfig) -> Config {
+    Config {
+        runtime: RuntimeConfig::default(),
+        api: ApiConfig::default(),
+        log: LogConfig::default(),
+        network: NetworkConfig::default(),
+        plugins: vec![plugin],
+        include: Vec::new(),
+    }
+}
+
+fn make_context(_registry: Arc<PluginRegistry>, name: &str, qtype: RecordType) -> DnsContext {
+    let mut request = Message::new();
+    request.add_question(Question::new(
+        Name::from_ascii(name).expect("benchmark qname should parse"),
+        qtype,
+        DNSClass::IN,
+    ));
+    DnsContext::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 5300)), request)
+}
+
+fn load_executor(
+    rt: &Runtime,
+    plugin: PluginConfig,
+) -> (
+    Arc<dyn oxidns::plugin::executor::Executor>,
+    Arc<PluginRegistry>,
+) {
+    let registry = rt
+        .block_on(init_plugins(make_config(plugin)))
+        .expect("benchmark plugin should initialize");
+    let executor = registry
+        .get_plugin("bench")
+        .expect("benchmark plugin should exist")
+        .to_executor();
+    (executor, registry)
+}
+
+fn bench_black_hole(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("plugin_black_hole");
+
+    for (label, qtype, ips) in [
+        ("a_1", RecordType::A, vec!["192.0.2.10"]),
+        (
+            "a_8",
+            RecordType::A,
+            vec![
+                "192.0.2.10",
+                "192.0.2.11",
+                "192.0.2.12",
+                "192.0.2.13",
+                "192.0.2.14",
+                "192.0.2.15",
+                "192.0.2.16",
+                "192.0.2.17",
+            ],
+        ),
+        ("aaaa_1", RecordType::AAAA, vec!["2001:db8::10"]),
+        (
+            "aaaa_8",
+            RecordType::AAAA,
+            vec![
+                "2001:db8::10",
+                "2001:db8::11",
+                "2001:db8::12",
+                "2001:db8::13",
+                "2001:db8::14",
+                "2001:db8::15",
+                "2001:db8::16",
+                "2001:db8::17",
+            ],
+        ),
+    ] {
+        let args: Value = serde_yaml_ng::from_str(&format!(
+            "ips:\n{}",
+            ips.iter()
+                .map(|ip| format!("  - {ip}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))
+        .expect("black_hole args should parse");
+        let (executor, registry) = load_executor(&rt, plugin_config("bench", "black_hole", args));
+
+        group.bench_function(BenchmarkId::new("execute", label), |b| {
+            b.iter(|| {
+                let mut ctx = make_context(registry.clone(), "bench.test.", qtype);
+                let step = rt
+                    .block_on(executor.execute_with_next(&mut ctx, None))
+                    .expect("black_hole execute should succeed");
+                black_box(step);
+                black_box(ctx.response().expect("response should be present"));
+            })
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_hosts(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("plugin_hosts");
+
+    for (label, entry, qname) in [
+        (
+            "full",
+            "full:bench.test 192.0.2.10 192.0.2.11",
+            "bench.test.",
+        ),
+        (
+            "domain",
+            "domain:bench.test 192.0.2.10 192.0.2.11",
+            "api.bench.test.",
+        ),
+        (
+            "keyword",
+            "keyword:bench 192.0.2.10 192.0.2.11",
+            "api-bench-edge.test.",
+        ),
+        (
+            "regex",
+            "regexp:^api[0-9]+\\.bench\\.test$ 192.0.2.10 192.0.2.11",
+            "api42.bench.test.",
+        ),
+    ] {
+        let args = hosts_args(&[entry.to_string()]);
+        let (executor, registry) = load_executor(&rt, plugin_config("bench", "hosts", args));
+
+        group.bench_function(BenchmarkId::new("execute", label), |b| {
+            b.iter(|| {
+                let mut ctx = make_context(registry.clone(), qname, RecordType::A);
+                let step = rt
+                    .block_on(executor.execute_with_next(&mut ctx, None))
+                    .expect("hosts execute should succeed");
+                black_box(step);
+                black_box(ctx.response().expect("response should be present"));
+            })
+        });
+    }
+
+    let mut large_entries = Vec::with_capacity(4_000);
+    for idx in 0..1_000usize {
+        large_entries.push(format!("full:edge-{idx}.bench.example 192.0.2.10"));
+        large_entries.push(format!("domain:zone-{idx}.bench.example 192.0.2.11"));
+        large_entries.push(format!("keyword:tenant-{idx} 192.0.2.12"));
+    }
+    for idx in 0..1_000usize {
+        large_entries.push(format!(
+            r"regexp:^svc{idx}-[a-z0-9-]+\.bench\.example$ 192.0.2.13"
+        ));
+    }
+
+    let (large_executor, large_registry) = load_executor(
+        &rt,
+        plugin_config("bench", "hosts", hosts_args(&large_entries)),
+    );
+    for (label, qname, qtype) in [
+        ("large_full", "edge-777.bench.example.", RecordType::A),
+        ("large_domain", "api.zone-777.bench.example.", RecordType::A),
+        (
+            "large_keyword",
+            "tenant-777-gateway.prod.example.",
+            RecordType::A,
+        ),
+        ("large_regex", "svc777-alpha.bench.example.", RecordType::A),
+        ("large_miss", "miss.case.example.", RecordType::A),
+    ] {
+        group.bench_function(BenchmarkId::new("execute", label), |b| {
+            b.iter(|| {
+                let mut ctx = make_context(large_registry.clone(), qname, qtype);
+                let step = rt
+                    .block_on(large_executor.execute_with_next(&mut ctx, None))
+                    .expect("hosts execute should succeed");
+                black_box(step);
+                black_box(ctx.response());
+            })
+        });
+    }
+
+    let (nadata_executor, nodata_registry) = load_executor(
+        &rt,
+        plugin_config(
+            "bench",
+            "hosts",
+            hosts_args(&["full:v4-only.bench.test 192.0.2.10".to_string()]),
+        ),
+    );
+    group.bench_function(BenchmarkId::new("execute", "family_mismatch_nodata"), |b| {
+        b.iter(|| {
+            let mut ctx = make_context(
+                nodata_registry.clone(),
+                "v4-only.bench.test.",
+                RecordType::AAAA,
+            );
+            let step = rt
+                .block_on(nadata_executor.execute_with_next(&mut ctx, None))
+                .expect("hosts execute should succeed");
+            black_box(step);
+            black_box(ctx.response().expect("response should be present"));
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_arbitrary(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("plugin_arbitrary");
+
+    for (label, rules, qname, qtype) in [
+        (
+            "a_1",
+            vec!["bench.test. 60 IN A 192.0.2.10"],
+            "bench.test.",
+            RecordType::A,
+        ),
+        (
+            "a_8",
+            vec![
+                "bench.test. 60 IN A 192.0.2.10",
+                "bench.test. 60 IN A 192.0.2.11",
+                "bench.test. 60 IN A 192.0.2.12",
+                "bench.test. 60 IN A 192.0.2.13",
+                "bench.test. 60 IN A 192.0.2.14",
+                "bench.test. 60 IN A 192.0.2.15",
+                "bench.test. 60 IN A 192.0.2.16",
+                "bench.test. 60 IN A 192.0.2.17",
+            ],
+            "bench.test.",
+            RecordType::A,
+        ),
+        (
+            "aaaa",
+            vec!["bench-v6.test. 60 IN AAAA 2001:db8::10"],
+            "bench-v6.test.",
+            RecordType::AAAA,
+        ),
+        (
+            "txt",
+            vec!["txt.bench.test. 60 IN TXT \"forge-bench\""],
+            "txt.bench.test.",
+            RecordType::TXT,
+        ),
+        (
+            "cname",
+            vec!["alias.bench.test. 60 IN CNAME target.bench.test."],
+            "alias.bench.test.",
+            RecordType::CNAME,
+        ),
+        (
+            "any",
+            vec![
+                "multi.bench.test. 60 IN A 192.0.2.10",
+                "multi.bench.test. 60 IN AAAA 2001:db8::10",
+                "multi.bench.test. 60 IN TXT \"ok\"",
+                "multi.bench.test. 60 IN CNAME target.bench.test.",
+            ],
+            "multi.bench.test.",
+            RecordType::ANY,
+        ),
+    ] {
+        let args: Value = serde_yaml_ng::from_str(&format!(
+            "rules:\n{}",
+            rules
+                .iter()
+                .map(|rule| format!("  - '{rule}'"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))
+        .expect("arbitrary args should parse");
+        let (executor, registry) = load_executor(&rt, plugin_config("bench", "arbitrary", args));
+
+        group.bench_function(BenchmarkId::new("execute", label), |b| {
+            b.iter(|| {
+                let mut ctx = make_context(registry.clone(), qname, qtype);
+                let step = rt
+                    .block_on(executor.execute_with_next(&mut ctx, None))
+                    .expect("arbitrary execute should succeed");
+                black_box(step);
+                black_box(ctx.response().expect("response should be present"));
+            })
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_redirect(c: &mut Criterion) {
+    let rt = runtime();
+    let mut rules = Vec::with_capacity(4_000);
+    for idx in 0..1_000usize {
+        rules.push(format!(
+            "full:edge-{idx}.bench.example target.bench.example"
+        ));
+        rules.push(format!(
+            "domain:zone-{idx}.bench.example target.bench.example"
+        ));
+        rules.push(format!("keyword:tenant-{idx} target.bench.example"));
+        rules.push(format!(
+            r"regexp:^svc{idx}-[a-z0-9-]+\.bench\.example$ target.bench.example"
+        ));
+    }
+    let (executor, registry) = load_executor(
+        &rt,
+        plugin_config("bench", "redirect", redirect_args(&rules)),
+    );
+    let mut group = c.benchmark_group("plugin_redirect");
+    for (label, qname) in [
+        ("full", "edge-777.bench.example."),
+        ("suffix_2", "api.zone-777.bench.example."),
+        ("suffix_10", "a.b.c.d.e.f.g.h.i.zone-777.bench.example."),
+        ("keyword", "tenant-777-gateway.prod.example."),
+        ("regexp", "svc777-alpha.bench.example."),
+        ("miss", "no-match.example."),
+    ] {
+        group.bench_function(BenchmarkId::new("execute", label), |b| {
+            b.iter(|| {
+                let mut ctx = make_context(registry.clone(), qname, RecordType::A);
+                let step = rt
+                    .block_on(executor.execute_with_next(&mut ctx, None))
+                    .expect("redirect execute should succeed");
+                black_box(step);
+                black_box(ctx.request());
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    plugin_local_answers,
+    bench_black_hole,
+    bench_hosts,
+    bench_arbitrary,
+    bench_redirect
+);
+criterion_main!(plugin_local_answers);

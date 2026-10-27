@@ -1,0 +1,446 @@
+// SPDX-FileCopyrightText: 2025 Sven Shi
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! `ipset` executor plugin.
+//!
+//! Writes response IP addresses into Linux ipset sets via the embedded Rust
+//! netlink backend.
+//!
+//! Runtime flow:
+//! - scans response answers and extracts unique A/AAAA addresses.
+//! - applies family-specific masks (`mask4`/`mask6`) and target sets.
+//! - sends batched add requests to a dedicated background writer thread.
+//!
+//! Performance and resilience:
+//! - request path uses non-blocking queue write (`try_send`) to avoid adding
+//!   latency to DNS hot path.
+//! - queue overflow drops side effects (best effort).
+//! - writer failure disables plugin to prevent repeated netlink overhead.
+
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+#[cfg(target_os = "linux")]
+use std::thread;
+
+use ahash::AHashSet;
+use async_trait::async_trait;
+#[cfg(target_os = "linux")]
+use ripset::{IpCidr, ipset_add};
+use serde::Deserialize;
+use serde_yaml_ng::Value;
+use tracing::debug;
+#[cfg(target_os = "linux")]
+use tracing::warn;
+
+use crate::config::types::PluginConfig;
+use crate::core::context::DnsContext;
+use crate::infra::error::{DnsError, Result};
+use crate::infra::observability::metrics::{
+    MetricLabel, MetricSample, MetricSink, MetricSource, register_metric_source,
+    unregister_metric_source,
+};
+use crate::plugin::executor::{ExecStep, Executor};
+use crate::plugin::{Plugin, PluginFactory, UninitializedPlugin};
+use crate::plugin_factory;
+
+#[cfg(target_os = "linux")]
+const IPSET_WRITER_QUEUE_SIZE: usize = 256;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct IpSetConfig {
+    /// IPv4 ipset name used for A answers.
+    set_name4: Option<String>,
+    /// IPv6 ipset name used for AAAA answers.
+    set_name6: Option<String>,
+    /// Prefix length used when writing IPv4 entries.
+    mask4: Option<u8>,
+    /// Prefix length used when writing IPv6 entries.
+    mask6: Option<u8>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct IpSetEntry {
+    set_name: String,
+    addr: IpAddr,
+    mask: u8,
+}
+
+#[derive(Debug)]
+struct IpSetMetrics {
+    tag: String,
+    entries_total: AtomicU64,
+    dropped_total: AtomicU64,
+    write_total: AtomicU64,
+    write_error_total: AtomicU64,
+}
+
+impl IpSetMetrics {
+    fn new(tag: String) -> Self {
+        Self {
+            tag,
+            entries_total: AtomicU64::new(0),
+            dropped_total: AtomicU64::new(0),
+            write_total: AtomicU64::new(0),
+            write_error_total: AtomicU64::new(0),
+        }
+    }
+}
+
+impl MetricSource for IpSetMetrics {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    fn plugin_type(&self) -> &'static str {
+        "ipset"
+    }
+
+    fn collect(&self, sink: &mut dyn MetricSink) {
+        let labels = [MetricLabel::new("plugin_tag", self.tag.as_str())];
+        sink.emit(MetricSample::counter(
+            "ipset_entries_total",
+            "Total IP entries enqueued for ipset writes.",
+            &labels,
+            self.entries_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "ipset_dropped_total",
+            "Total ipset write batches dropped because the writer queue was full.",
+            &labels,
+            self.dropped_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "ipset_write_total",
+            "Total IP entries successfully written to ipset via netlink.",
+            &labels,
+            self.write_total.load(Ordering::Relaxed),
+        ));
+        sink.emit(MetricSample::counter(
+            "ipset_write_error_total",
+            "Total ipset netlink write failures.",
+            &labels,
+            self.write_error_total.load(Ordering::Relaxed),
+        ));
+    }
+}
+
+#[derive(Debug)]
+struct IpSetExecutor {
+    tag: String,
+    set_name4: Option<String>,
+    set_name6: Option<String>,
+    mask4: u8,
+    mask6: u8,
+    enabled: Arc<AtomicBool>,
+    metrics: Arc<IpSetMetrics>,
+    #[cfg(target_os = "linux")]
+    writer: SyncSender<Vec<IpSetEntry>>,
+}
+
+#[async_trait]
+impl Plugin for IpSetExecutor {
+    fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    async fn init(&mut self, _context: &crate::plugin::PluginInitContext<'_>) -> Result<()> {
+        register_metric_source(self.metrics.clone())
+    }
+
+    async fn destroy(&self) -> Result<()> {
+        unregister_metric_source(&self.tag);
+        self.enabled.store(false, Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        {
+            // Wake the writer thread if it is blocked on recv so it can observe
+            // the disabled flag and exit quickly.
+            let _ = self.writer.try_send(Vec::new());
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Executor for IpSetExecutor {
+    #[hotpath::measure]
+    async fn execute(&self, context: &mut DnsContext) -> Result<ExecStep> {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return Ok(ExecStep::Next);
+        }
+
+        let Some(response) = context.response() else {
+            return Ok(ExecStep::Next);
+        };
+        let answers = response.answers();
+        if answers.is_empty() {
+            return Ok(ExecStep::Next);
+        }
+
+        let mut entries = AHashSet::new();
+        for answer in answers {
+            if let Some(ip) = answer.ip_addr() {
+                let (set_name, mask) = match ip {
+                    IpAddr::V4(_) => (self.set_name4.as_deref(), self.mask4),
+                    IpAddr::V6(_) => (self.set_name6.as_deref(), self.mask6),
+                };
+                let Some(set_name) = set_name else {
+                    continue;
+                };
+
+                entries.insert(IpSetEntry {
+                    set_name: set_name.to_string(),
+                    addr: ip,
+                    mask,
+                });
+            }
+        }
+
+        if entries.is_empty() {
+            return Ok(ExecStep::Next);
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let entries: Vec<IpSetEntry> = entries.into_iter().collect();
+            let entry_count = entries.len() as u64;
+            match self.writer.try_send(entries) {
+                Ok(()) => {
+                    self.metrics
+                        .entries_total
+                        .fetch_add(entry_count, Ordering::Relaxed);
+                }
+                Err(TrySendError::Full(_)) => {
+                    // Best-effort side effect: dropping write preserves DNS
+                    // path latency.
+                    self.metrics.dropped_total.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.metrics.dropped_total.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        plugin = %self.tag,
+                        "ipset writer disconnected, disabling plugin"
+                    );
+                    self.enabled.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = entries;
+        }
+
+        Ok(ExecStep::Next)
+    }
+}
+
+#[derive(Debug, Clone)]
+#[plugin_factory("ipset")]
+pub struct IpSetFactory;
+
+impl PluginFactory for IpSetFactory {
+    fn create(
+        &self,
+        plugin_config: &PluginConfig,
+        _init_context: &crate::plugin::PluginInitContext<'_>,
+    ) -> Result<UninitializedPlugin> {
+        let cfg = parse_config(plugin_config.args.clone())?;
+        let mask4 = cfg.mask4.unwrap_or(24);
+        let mask6 = cfg.mask6.unwrap_or(32);
+        validate_masks(mask4, mask6)?;
+
+        debug!(
+            plugin = %plugin_config.tag,
+            set_name4 = ?cfg.set_name4,
+            set_name6 = ?cfg.set_name6,
+            mask4,
+            mask6,
+            "ipset plugin configured"
+        );
+
+        let metrics = Arc::new(IpSetMetrics::new(plugin_config.tag.clone()));
+
+        #[cfg(target_os = "linux")]
+        let enabled = Arc::new(AtomicBool::new(true));
+        #[cfg(target_os = "linux")]
+        let writer =
+            spawn_ipset_writer(plugin_config.tag.as_str(), enabled.clone(), metrics.clone())?;
+
+        #[cfg(not(target_os = "linux"))]
+        let enabled = Arc::new(AtomicBool::new(true));
+
+        Ok(UninitializedPlugin::Executor(Box::new(IpSetExecutor {
+            tag: plugin_config.tag.clone(),
+            set_name4: cfg.set_name4.filter(|v| !v.trim().is_empty()),
+            set_name6: cfg.set_name6.filter(|v| !v.trim().is_empty()),
+            mask4,
+            mask6,
+            enabled,
+            metrics,
+            #[cfg(target_os = "linux")]
+            writer,
+        })))
+    }
+
+    fn quick_setup(&self, tag: &str, param: Option<String>) -> Result<UninitializedPlugin> {
+        let mut cfg = IpSetConfig::default();
+        let raw = param.unwrap_or_default();
+
+        for field in raw.split_whitespace() {
+            let parts: Vec<&str> = field.split(',').collect();
+            if parts.len() != 3 {
+                return Err(DnsError::plugin(format!(
+                    "invalid ipset quick setup token '{}', expected set,family,mask",
+                    field
+                )));
+            }
+            let mask = parts[2].parse::<u8>().map_err(|e| {
+                DnsError::plugin(format!("invalid ipset mask '{}': {}", parts[2], e))
+            })?;
+            match parts[1] {
+                "inet" => {
+                    cfg.set_name4 = Some(parts[0].to_string());
+                    cfg.mask4 = Some(mask);
+                }
+                "inet6" => {
+                    cfg.set_name6 = Some(parts[0].to_string());
+                    cfg.mask6 = Some(mask);
+                }
+                other => {
+                    return Err(DnsError::plugin(format!(
+                        "invalid ipset family '{}', expected inet or inet6",
+                        other
+                    )));
+                }
+            }
+        }
+
+        let mask4 = cfg.mask4.unwrap_or(24);
+        let mask6 = cfg.mask6.unwrap_or(32);
+        validate_masks(mask4, mask6)?;
+
+        let metrics = Arc::new(IpSetMetrics::new(tag.to_string()));
+
+        #[cfg(target_os = "linux")]
+        let enabled = Arc::new(AtomicBool::new(true));
+        #[cfg(target_os = "linux")]
+        let writer = spawn_ipset_writer(tag, enabled.clone(), metrics.clone())?;
+
+        #[cfg(not(target_os = "linux"))]
+        let enabled = Arc::new(AtomicBool::new(true));
+
+        Ok(UninitializedPlugin::Executor(Box::new(IpSetExecutor {
+            tag: tag.to_string(),
+            set_name4: cfg.set_name4,
+            set_name6: cfg.set_name6,
+            mask4,
+            mask6,
+            enabled,
+            metrics,
+            #[cfg(target_os = "linux")]
+            writer,
+        })))
+    }
+}
+
+fn parse_config(args: Option<Value>) -> Result<IpSetConfig> {
+    let Some(args) = args else {
+        return Ok(IpSetConfig::default());
+    };
+
+    serde_yaml_ng::from_value(args)
+        .map_err(|e| DnsError::plugin(format!("failed to parse ipset config: {}", e)))
+}
+
+fn validate_masks(mask4: u8, mask6: u8) -> Result<()> {
+    if mask4 > 32 {
+        return Err(DnsError::plugin("ipset mask4 must be in range 0..=32"));
+    }
+    if mask6 > 128 {
+        return Err(DnsError::plugin("ipset mask6 must be in range 0..=128"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_ipset_writer(
+    tag: &str,
+    enabled: Arc<AtomicBool>,
+    metrics: Arc<IpSetMetrics>,
+) -> Result<SyncSender<Vec<IpSetEntry>>> {
+    let (tx, rx) = sync_channel::<Vec<IpSetEntry>>(IPSET_WRITER_QUEUE_SIZE);
+    let thread_tag = tag.to_string();
+    thread::Builder::new()
+        .name(format!("ipset-{}", thread_tag))
+        .spawn(move || {
+            while enabled.load(Ordering::Relaxed) {
+                let Ok(entries) = rx.recv() else {
+                    break;
+                };
+                if entries.is_empty() {
+                    continue;
+                }
+                let entry_count = entries.len() as u64;
+                if let Err(e) = write_ipset_entries(&entries) {
+                    metrics.write_error_total.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        plugin = %thread_tag,
+                        err = %e,
+                        "ipset netlink execution failed, disabling plugin"
+                    );
+                    enabled.store(false, Ordering::Relaxed);
+                    break;
+                }
+                metrics
+                    .write_total
+                    .fetch_add(entry_count, Ordering::Relaxed);
+            }
+        })
+        .map_err(|e| DnsError::plugin(format!("failed to spawn ipset writer thread: {}", e)))?;
+    Ok(tx)
+}
+
+#[cfg(target_os = "linux")]
+fn write_ipset_entries(entries: &[IpSetEntry]) -> Result<()> {
+    for entry in entries {
+        let cidr = IpCidr::new(entry.addr, entry.mask).map_err(|e| {
+            DnsError::plugin(format!("invalid ipset entry '{}': {}", entry.addr, e))
+        })?;
+        ipset_add(&entry.set_name, cidr).map_err(|e| {
+            DnsError::plugin(format!(
+                "ipset add failed for set '{}' and prefix '{}': {}",
+                entry.set_name, cidr, e
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    use ripset::IpCidr;
+
+    use super::*;
+
+    #[test]
+    fn test_parse_config_rejects_invalid_masks() {
+        assert!(validate_masks(33, 32).is_err());
+        assert!(validate_masks(24, 129).is_err());
+        assert!(validate_masks(24, 32).is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_ipcidr_normalizes_host_bits() {
+        assert_eq!(
+            IpCidr::new(IpAddr::V4("192.0.2.10".parse().unwrap()), 24)
+                .unwrap()
+                .to_string(),
+            "192.0.2.0/24"
+        );
+    }
+}

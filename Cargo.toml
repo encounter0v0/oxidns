@@ -1,0 +1,444 @@
+[workspace]
+members = [
+    ".",
+    "crates/macros",
+    "crates/ripset",
+    "crates/proto",
+    "crates/zoneparser",
+]
+
+[package]
+name = "oxidns"
+version = "1.6.1"
+edition = "2024"
+authors = ["Sven Shi <isvenshi@gmail.com>"]
+description = "A Rust-powered DNS engine inspired by MosDNS, designed for performance and complete configurability."
+repository = "https://github.com/svenshi/oxidns"
+license = "GPL-3.0-or-later"
+readme = "README_EN.md"
+keywords = ["dns", "rustdns", "pipeline", "flow", "dns-server"]
+categories = ["network-programming"]
+exclude = [
+    ".github/**",
+    "ai/**",
+    "benchmarks/**",
+    "docs/**",
+    "webui/**",
+]
+
+
+[dependencies]
+# Core async runtime and shared infrastructure
+async-trait = "0.1"
+futures = "0.3.31"
+socket2 = "0.6.4"
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+
+# Configuration, CLI, and observability
+jiff = "0.2"
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml_ng = "0.10.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
+# Core data structures and utility crates
+ahash = "0.8.12"
+arc-swap = "1.9.1"
+bytes = "1.11"
+crossbeam-queue = "0.3.12"
+dashmap = "6"
+inventory = "0.3"
+lazy_static = "1.5"
+libc = "0.2"
+rand = "0.10.1"
+url = "2.5"
+fs2 = "0.4"
+hex = "0.4"
+sha2 = "0.11.0"
+wincode = { version = "0.6", features = ["derive"] }
+oxidns-proto = { version = "0.1.6", path = "crates/proto" }
+oxidns-macros = { version = "0.1.0", path = "crates/macros" }
+hotpath = "0.26"
+
+# Optional upgrade dependencies and response snapshot compression.
+semver = { version = "1.0", optional = true }
+# Shared by upgrade archives and query-recorder response snapshots.
+flate2 = { version = "1.1", optional = true }
+tar = { version = "0.4", optional = true }
+
+# DNS transport and TLS stack used by server plugins and outbound DNS clients.
+# All of these are now optional: the `api` / `webui` / `metrics` features pull
+# in the HTTP server + TLS server stack; `server-dot` / `server-doh` /
+# `resolver-dot` / `resolver-doh` / `upstream-dot` / `upstream-doh` pull in
+# their respective pieces; `quinn` / `h3` / `h3-quinn` are reached through
+# `server-doq` / `server-doh3` and the shared `_dns-client-*` features.
+h2 = { version = "0.4", optional = true }
+quinn = { version = "0.11.9", default-features = false, features = ["bloom", "log", "runtime-tokio", "rustls-ring"], optional = true }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+rustls = { version = "0.23.40", default-features = false, features = ["logging", "ring", "std", "tls12"], optional = true }
+rustls-pemfile = { version = "2.2.0", optional = true }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"], optional = true }
+webpki-roots = { version = "1.0.2", optional = true }
+
+# HTTP stack for DoH server/client paths, the management API, and the
+# download executor.
+base64 = "0.23"
+http = { version = "1.4", optional = true }
+http-body-util = { version = "0.1.3", optional = true }
+hyper = { version = "1.10.1", features = ["server", "client", "http1", "http2"], optional = true }
+hyper-rustls = { version = "0.27.8", default-features = false, features = ["http1", "http2", "logging", "ring", "tls12", "webpki-tokio"], optional = true }
+hyper-util = { version = "0.1.20", features = ["server", "client", "client-legacy", "http1", "http2", "tokio"], optional = true }
+tower-service = { version = "0.3", optional = true }
+
+# Matcher and provider plugin dependencies.
+# `prost` is pulled in by `provider-protobuf` (geoip + geosite + v2ray_dat).
+# `aho-corasick` is kept always-on because it backs `core::rule_matcher::domain`
+# in addition to the `hosts` / `redirect` executors.
+aho-corasick = "1.1.4"
+prost = { version = "0.14", optional = true }
+regex = "1.12.2"
+
+# Optional TaskCenter calendar scheduling and executor plugin dependencies.
+cronexpr = { version = "1.5.0", optional = true }
+fast-socks5 = "1.0.0"
+mikrotik-rs = { version = "0.9.0", optional = true }
+rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
+zoneparser = { package = "oxidns-zoneparser", version = "0.1.2", path = "crates/zoneparser", optional = true }
+
+# Service management
+service-manager = "0.11.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ripset = { package = "oxidns-ripset", version = "0.1.3", path = "crates/ripset", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+zip = { version = "8", optional = true }
+windows-service = "0.8"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_Networking_WinSock", "Win32_System_IO"] }
+
+
+# =============================================================================
+# Features
+# -----------------------------------------------------------------------------
+# Three layers:
+#   1. Bundles: `minimal` / `standard` / `full` (default = full).
+#   2. Granular feature flags (one per protocol / heavy plugin / surface).
+#   3. Private `_` features that aggregate shared optional deps across
+#      multiple public features (kept private so consumers don't enable them
+#      directly).
+#
+# Phase 1 (complete): every protocol stack and management surface is
+# behind a feature flag. `--no-default-features --features minimal`
+# builds a forwarder-only binary with no hyper / rustls / quinn / ...
+#
+# Cargo build cookbook:
+#   cargo build --release                                                # = full
+#   cargo build --release --no-default-features --features minimal       # ~smallest
+#   cargo build --release --no-default-features --features standard
+#   cargo build --release --no-default-features --features "minimal,plugin-mikrotik"
+# =============================================================================
+[features]
+default = ["full"]
+
+# --- Bundles ---------------------------------------------------------------
+
+# Minimal core DNS forwarder: UDP + TCP listeners, UDP + TCP upstream,
+# sequence / forward / cache / fallback / hosts / redirect / dual_selector /
+# ecs_handler / ttl / drop_resp / black_hole / debug_print / reload, all matchers,
+# and the `domain_set` + `ip_set` providers.
+# Nothing else is compiled. No hyper / rustls / quinn / h2 / h3 / zoneparser.
+minimal = []
+
+# Typical home / router build: management API + encrypted protocols +
+# WebUI + self-upgrade tooling + common providers + the leaf executor plugins
+# most configs reach for. No mikrotik, no ipset/nftset.
+standard = [
+    "api",
+    "webui",
+    "metrics",
+    "server-dot",
+    "server-doh",
+    "server-doq",
+    "resolver-dot",
+    "resolver-doh",
+    "resolver-doq",
+    "upstream-dot",
+    "upstream-doh",
+    "upstream-doq",
+    "provider-protobuf",
+    "provider-adguard-rule",
+    "plugin-client-ip-from-ecs",
+    "plugin-arbitrary",
+    "plugin-response",
+    "plugin-cron",
+    "plugin-dynamic-domain",
+    "plugin-ip-selector",
+    "plugin-script",
+    "plugin-download",
+    "plugin-http-request",
+    "plugin-reverse-lookup",
+    "plugin-upgrade",
+    "plugin-query-recorder",
+]
+
+# Full functionality: equivalent to the pre-feature binary.
+full = [
+    "standard",
+    "server-doh3",
+    "resolver-doh3",
+    "upstream-doh3",
+    "plugin-mikrotik",
+    "plugin-ipset",
+]
+
+# --- Management API surface ------------------------------------------------
+
+# HTTP management API (control / health / metrics / logs / config /
+# plugin-scoped endpoints). Pulls in hyper(server) + rustls(server) so HTTPS
+# can be enabled from config; plain HTTP still works without `_tls-*` paths
+# being exercised at runtime.
+api = ["_http-server", "_tls-server"]
+
+# Static WebUI assets served from the api hub (requires `api`).
+webui = ["api"]
+
+# Prometheus `/metrics` endpoint on the api hub (requires `api`). The
+# in-process `MetricSource` registry stays in core regardless, so disabling
+# this only drops the HTTP surface.
+metrics = ["api"]
+
+# --- Granular protocol features --------------------------------------------
+
+# Inbound DoT (TLS over TCP) server. Pulls in the TLS server stack.
+server-dot = ["_tls-server"]
+
+# Inbound DoH (HTTP/1.1 + HTTP/2 over TLS) server. Pulls in hyper(server) +
+# TLS server.
+server-doh = ["_http-server", "_tls-server"]
+
+# Inbound DoQ server (QUIC). Pulls in the `quinn` server stack and the
+# rustls glue it needs for the QUIC TLS layer.
+server-doq = ["dep:quinn", "_tls-server"]
+
+# Inbound HTTP/3 leg of the DoH server (requires `server-doh`). Adds
+# `h3` + `h3-quinn` + `quinn` on top.
+server-doh3 = ["server-doh", "dep:h3", "dep:h3-quinn", "dep:quinn"]
+
+# Outbound resolver DoT nameserver support.
+resolver-dot = ["_dns-client-dot"]
+
+# Outbound resolver DoH (HTTP/2) nameserver support.
+resolver-doh = ["_dns-client-doh"]
+
+# Outbound resolver DoQ nameserver support.
+resolver-doq = ["_dns-client-doq"]
+
+# Outbound resolver HTTP/3 nameserver support.
+resolver-doh3 = ["resolver-doh", "_dns-client-doh3"]
+
+# Outbound DoT upstream. Pulls in the shared DoT client stack.
+upstream-dot = ["_dns-client-dot"]
+
+# Outbound DoH (HTTP/2) upstream. Pulls in the shared DoH client stack.
+upstream-doh = ["_dns-client-doh"]
+
+# Outbound DoQ upstream. Pulls in the shared DoQ client stack.
+upstream-doq = ["_dns-client-doq"]
+
+# Outbound HTTP/3 leg of DoH upstreams (`h3://` scheme or
+# `enable_http3: true`). Requires `upstream-doh`.
+upstream-doh3 = ["upstream-doh", "_dns-client-doh3"]
+
+# --- Granular plugin features ----------------------------------------------
+
+# All MikroTik RouterOS executors.
+plugin-mikrotik = ["plugin-ros-address-list", "plugin-ros-route"]
+
+# `ros_address_list` executor (MikroTik RouterOS API integration).
+plugin-ros-address-list = ["dep:mikrotik-rs", "mikrotik-rs/tokio-tls", "_tls-client"]
+
+# `ros_route` executor (MikroTik RouterOS dynamic-route integration).
+plugin-ros-route = ["dep:mikrotik-rs", "mikrotik-rs/tokio-tls", "_tls-client"]
+
+# `query_recorder` executor backed by bundled SQLite. Its management API
+# surface is part of the build, hence the `api` requirement.
+plugin-query-recorder = ["api", "_sequence-step-recording", "dep:rusqlite", "dep:flate2"]
+
+# `ipset` + `nftset` executors (Linux netlink-backed firewall set sync).
+plugin-ipset = ["dep:ripset"]
+
+# `cron` executor (cron-expression scheduled triggers).
+plugin-cron = ["_task-cron"]
+
+# `dynamic_domain_set` provider + `learn_domain` executor (runtime-writable
+# domain rule set with background-flush persistence and pipeline learning).
+plugin-dynamic-domain = []
+
+# `ip_selector` executor (response IP scoring and selection via active probing).
+plugin-ip-selector = []
+
+# `script` executor (run an external command per request).
+plugin-script = []
+
+# `client_ip_from_ecs` executor (replace the request-local client IP from ECS).
+plugin-client-ip-from-ecs = []
+
+# `arbitrary` executor (zone-style static DNS records).
+plugin-arbitrary = ["dep:zoneparser"]
+
+# `response` executor (explicit DNS response templates).
+plugin-response = ["dep:zoneparser"]
+
+# Self-upgrade CLI sub-command + `upgrade` executor (archive download &
+# verify, then replace the binary). Needs the HTTP client to fetch
+# release archives.
+plugin-upgrade = [
+    "_http-client",
+    "dep:semver",
+    "dep:flate2",
+    "dep:tar",
+    "dep:zip",
+]
+
+# `download` executor (fetch remote files into the working directory).
+# Needs the HTTP client.
+plugin-download = ["_http-client"]
+
+# `http_request` executor (send arbitrary HTTP requests as a side effect).
+# Needs the HTTP client.
+plugin-http-request = ["_http-client"]
+
+# `reverse_lookup` executor + its management API surface.
+plugin-reverse-lookup = ["api"]
+
+# `geoip` + `geosite` + `v2ray_dat` providers (share `prost`).
+provider-protobuf = ["dep:prost"]
+
+# `adguard_rule` provider.
+provider-adguard-rule = []
+
+# --- Private aggregator features -------------------------------------------
+# These are pulled in by the public features above and should not be
+# enabled directly. They exist so each crate group is declared once.
+
+_task-cron = ["dep:cronexpr"]
+
+_tls-base = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
+_tls-client = ["_tls-base", "dep:webpki-roots"]
+_tls-server = ["_tls-base"]
+_http-server = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:tower-service",
+]
+_http-client = [
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:hyper-rustls",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:tower-service",
+    "_tls-client",
+]
+
+# Request-local sequence step capture used by observer plugins such as
+# `query_recorder`.
+_sequence-step-recording = []
+
+# Shared outbound DNS client protocol stacks used by resolver and upstream.
+_dns-client-dot = ["_tls-client"]
+_dns-client-doh = ["_http-client", "_tls-client", "dep:h2"]
+_dns-client-doq = ["dep:quinn", "_tls-client"]
+_dns-client-doh3 = ["_dns-client-doh", "dep:h3", "dep:h3-quinn", "dep:quinn"]
+
+# --- Profiling -------------------------------------------------------------
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath/hotpath-alloc"]
+
+[dev-dependencies]
+criterion = "0.8.2"
+tempfile = "3.23.0"
+tokio = { version = "1", features = ["test-util"] }
+# Integration tests use hyper to spin up mock HTTP servers regardless of
+# which library features are enabled, so we re-declare them as dev deps.
+http-body-util = "0.1.3"
+hyper = { version = "1.9.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["server", "tokio"] }
+
+[[bench]]
+name = "message_codec"
+harness = false
+
+[[bench]]
+name = "plugin_local_answers"
+harness = false
+
+[[bench]]
+name = "domain_rule_matcher"
+harness = false
+
+[[bench]]
+name = "ip_rule_matcher"
+harness = false
+
+[[bench]]
+name = "response_classification"
+harness = false
+
+
+[[bin]]
+name = "oxidns"
+path = "src/main.rs"
+
+[lib]
+name = "oxidns"
+path = "src/lib.rs"
+doctest = false
+
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+
+[package.metadata.deb]
+maintainer = "Sven Shi <isvenshi@gmail.com>"
+copyright = "2026, Sven Shi"
+depends = "$auto"
+section = "net"
+priority = "optional"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+A Rust-powered DNS engine inspired by MosDNS, designed for performance and complete configurability.
+"""
+assets = [
+    ["target/release/oxidns", "usr/bin/oxidns", "755"],
+    ["config.yaml", "etc/oxidns/config.yaml", "644"],
+    ["webui/out/**/*", "usr/share/oxidns/webui", "644"],
+]
+maintainer-scripts = "packaging/debian"
+
+[package.metadata.deb.systemd-units]
+enable = true
+unit-scripts = "packaging"

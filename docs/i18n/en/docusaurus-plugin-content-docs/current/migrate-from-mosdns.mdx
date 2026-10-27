@@ -1,0 +1,210 @@
+---
+title: Migrating from mosdns
+sidebar_position: 7
+---
+
+import Admonition from '@theme/Admonition';
+
+<Admonition type="tip" title="Compatible model, but runtime semantics still need validation">
+
+OxiDNS and mosdns v5 share a plugin-oriented configuration model, so common configurations are useful migration inputs. Do not replace a production service without validation: plugin availability, defaults, edge semantics, platform support, and runtime paths can still differ.
+
+</Admonition>
+
+OxiDNS and mosdns v5 share almost the same plugin model and configuration structure: the `plugins` array, `sequence` orchestration, `jump` / `goto` / `accept` / `return` / `reject` control flow, and plugins such as `forward` / `cache` / `hosts` / `domain_set` / `ip_set` / `geosite` / `geoip` / `ipset` / `fallback` — including their field names — are all highly compatible.
+
+## Recommended Migration Workflow
+
+1. Back up the original config, rule files, cache/database files, and service definition. Record listener addresses and expected upstream behavior.
+2. Select an OxiDNS bundle containing the required plugins and protocols, then inspect the binary capabilities:
+
+   ```bash
+   oxidns build-info
+   ```
+
+3. Run static validation with the same working directory used in production and inspect the dependency graph:
+
+   ```bash
+   oxidns check -c /etc/oxidns/config.yaml -d /var/lib/oxidns --graph
+   ```
+
+4. Resolve plugin type, tag, field, and reference errors. Do not silence validation by deleting entries that change the policy chain.
+5. Start on non-production ports and verify positive answers, NXDOMAIN/NODATA, CNAME, TTL, cache hits, fallback, rule updates, and external side effects.
+6. Before switching traffic, check `/api/readyz`, logs, and critical metrics, and keep a tested rollback path to the original service.
+
+Review these migration boundaries:
+
+| Area | What to verify |
+| --- | --- |
+| Compiled capabilities | Plugins and protocols may be gated by Cargo features/bundles; use `oxidns build-info` as the authority. |
+| Plugin tags | Tags must satisfy OxiDNS's ASCII path grammar and must not use reserved Quick Setup prefixes. |
+| Relative paths | Runtime-relative rule, log, SQLite, and WebUI paths use `-d/--working-dir`; `include` paths are relative to the file declaring them. |
+| Platform capabilities | System integrations such as `ipset` / `nftset` depend on the operating system and privileges. |
+| Same-name fields | Matching plugin and field names do not guarantee identical defaults or error-response semantics; verify with real queries. |
+| Outbound networking | With `network.outbound.default`, upstreams without an explicit outbound inherit the default profile. |
+
+## Syntax Differences to Check During Migration
+
+### `env` matcher
+
+In OxiDNS, every item in the `env` matcher's `args` array is an independent environment expression.
+
+```yaml
+- tag: env_profile_prod
+  type: env
+  args:
+    - "PROFILE=prod"
+    - "FEATURE_X"
+```
+
+Use `KEY=VALUE` for exact matches; `KEY:VALUE` is also accepted as a rule-expression-style alias. `KEY`, `KEY:`, and `KEY=` only check that the variable exists. Each string item in the array is a complete expression and is not split further on commas or whitespace; if an environment value contains commas or spaces, write it as its own quoted array item, such as `"NO_PROXY=localhost,127.0.0.1"`.
+
+Be careful with two bare items: `["PROFILE", "prod"]` checks that both `PROFILE` and `prod` exist. It does not mean `PROFILE == prod`. If a migrated config used that two-token value form, rewrite it as `"PROFILE=prod"` or `"PROFILE:prod"`.
+
+## Feature Overview
+
+Once migration is complete, the following capabilities are available to enable on demand.
+
+| Feature | Description |
+| --- | --- |
+| [`short_circuit`](#short_circuit-stop-on-match) | Stop the sequence immediately on a plugin hit |
+| [Log Rotation](#log-rotation) | Built-in daily/hourly splitting and cleanup, no logrotate needed |
+| [WebUI Console](#webui-console) | Browser-based config editing, query history, and live stream |
+| [HTTP Management API](#http-management-api) | REST API with hot reload, auth, and metrics scraping |
+| [`query_recorder`](#query_recorder-query-history-and-live-streaming) | Persist queries to SQLite + SSE live push |
+| [`ros_address_list`](#ros_address_list-routeros-route-sync) | Sync resolved IPs to RouterOS address-list |
+| [`reload_provider`](#reload_provider-targeted-reload) | Reload specific provider snapshots without a full restart |
+| [`download` + `cron`](#download--cron-subscription-auto-update) | Auto-download rule files and schedule background tasks |
+| [Environment Variables](#environment-variable-substitution) | `${VAR}` / `${VAR:-default}` placeholders for sensitive fields |
+| [Performance](#performance) | Rust + Tokio: lower memory, lower tail latency, zero GC pauses |
+
+---
+
+## Observability & Debugging
+
+### WebUI Console
+
+A built-in web management interface for viewing and editing configuration, inspecting plugin state, streaming real-time queries, and browsing query history — all from a browser, no extra tools required. See [WebUI](webui.md).
+
+### HTTP Management API
+
+`api.http` exposes a REST API for hot reload, health checks, Prometheus metrics scraping, and plugin status queries, with Basic Auth and TLS support. See [Management API](api.mdx).
+
+```yaml
+api:
+  http:
+    listen: "127.0.0.1:9088"
+    auth:
+      type: basic
+      username: "admin"
+      password: "secret"
+```
+
+### `query_recorder`: Query History and Live Streaming
+
+Persists every request, response, and sequence execution path to SQLite. Provides a history query API and SSE live-push endpoint, powering the WebUI real-time query stream panel.
+
+```yaml
+- tag: recorder_main
+  type: query_recorder
+  args:
+    path: ./query-recorder.sqlite
+    memory_tail: 1024
+    retention_days: 7
+```
+
+---
+
+## Configuration & Runtime
+
+### `short_circuit`: Stop on Match
+
+Executor plugins including `forward`, `cache`, `hosts`, `fallback`, `black_hole`, `prefer_ipv4`, and `prefer_ipv6` all support a `short_circuit` option. When enabled, the plugin immediately ends the current sequence's remaining steps upon a hit — no extra `has_resp` + `accept` needed.
+
+```yaml
+- tag: cache_main
+  type: cache
+  args:
+    size: 8192
+    short_circuit: true    # return immediately on cache hit, skip remaining steps
+    cache_negative: true
+```
+
+### Log Rotation
+
+`log.rotation` provides built-in log splitting by minute, hour, day, or week, with automatic cleanup of old files — no external tools like logrotate required.
+
+```yaml
+log:
+  level: info
+  file: ./oxidns.log
+  rotation:
+    type: daily       # minutely / hourly / daily / weekly / never
+    max_files: 7      # max historical files to keep; 0 disables auto-cleanup
+```
+
+### Environment Variable Substitution
+
+Configuration files support `${VAR}` and `${VAR:-default}` placeholders so sensitive fields like passwords and certificate paths can be injected from environment variables instead of being hardcoded.
+
+---
+
+## System Integration
+
+### `ros_address_list`: RouterOS Route Sync
+
+Syncs resolved IPs to a MikroTik RouterOS address-list in real time, enabling DNS-driven traffic routing alongside routing policy rules. See [`ros_address_list`](plugin-reference/executor/integrations.mdx#ros_address_list).
+
+---
+
+## Rule Maintenance
+
+### `reload_provider`: Targeted Reload
+
+Refreshes the internal data snapshot of specific providers only, without triggering a full global reload. Ideal for rule subscription updates that only need to rebuild the rule set without interrupting in-flight requests.
+
+```yaml
+- tag: reload_ad_rules
+  type: reload_provider
+  args:
+    - "$ad_rules"
+```
+
+### `download` + `cron`: Subscription Auto-Update
+
+`download` fetches files over HTTP/HTTPS and atomically replaces local copies. `cron` schedules tasks in the background on a fixed interval or cron expression. Together they enable fully automatic rule subscription updates without restarting the process.
+
+```yaml
+- tag: rules_cron
+  type: cron
+  args:
+    timezone: "America/New_York"
+    jobs:
+      - name: refresh_rules
+        interval: 12h
+        executors:
+          - "$download_rules"
+          - "$reload_ad_rules"
+```
+
+---
+
+## Performance
+
+OxiDNS is built on Rust + Tokio and has no GC pauses. Performance relative to mosdns varies by scenario:
+
+- **Rule set matching (`domain set`, `composite provider chain`)**: OxiDNS has a significant advantage — several times higher QPS and much lower latency under load.
+- **Concurrent upstream queries**: OxiDNS leads in both throughput and latency.
+- **Latency jitter**: OxiDNS produces more stable latency in most scenarios.
+- **Local answers, basic sequence, ip set filtering**: mosdns is on par or slightly faster.
+- **Basic forwarding**: QPS is comparable; the gap is small.
+
+See [Benchmarks](benchmarks.md) for details.
+
+---
+
+## Next Steps
+
+- [Configuration Overview](configuration.md) — Top-level fields and runtime parameters
+- [Plugin Overview](plugin-reference/overview.md) — Full list of built-in plugins
+- [Common Policy Scenarios](scenarios.md) — Typical deployment configuration examples
