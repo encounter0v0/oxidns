@@ -70,7 +70,10 @@ export function AppSidebar() {
   const isOfflineMode = useAppStore((s) => s.isOfflineMode);
 
   return (
-    <Sidebar variant="inset" className="liquid-glass-sidebar border-r border-border/40">
+    <Sidebar
+      variant="inset"
+      className="liquid-glass-sidebar md:m-3 md:h-[calc(100svh-1.5rem)] rounded-2xl overflow-hidden shadow-xl border border-white/30 dark:border-white/10"
+    >
       {/* Brand Header */}
       <SidebarHeader className="h-16 justify-center border-b border-border/40 px-4">
         <SidebarMenu>

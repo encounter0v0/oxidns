@@ -12,7 +12,6 @@ import { useAppStore } from "@/lib/store";
 import { useAuthStore } from "@/lib/auth-store";
 import { useUpdateStore } from "@/lib/update-store";
 import { AppHeader } from "@/components/shell/app-header";
-import { WallpaperBackground } from "@/components/theme/wallpaper-background";
 import {
   LoginRequired,
 } from "@/components/shell/connection-required";
@@ -155,7 +154,6 @@ export default function ConsoleLayout({
 
   return (
     <TooltipProvider>
-      <WallpaperBackground />
       <SidebarProvider
         className="h-svh overflow-hidden bg-transparent"
         open={editorMode ? false : sidebarOpen}
@@ -166,7 +164,7 @@ export default function ConsoleLayout({
         }}
       >
         <AppSidebar />
-        <SidebarInset className="h-svh min-h-0 overflow-hidden md:h-[calc(100svh-1rem)] bg-transparent">
+        <SidebarInset className="h-svh min-h-0 overflow-hidden md:h-[calc(100svh-1.5rem)] md:my-3 md:mr-3 rounded-2xl bg-transparent">
           {editorMode ? (
             <div className="flex h-full min-h-0 flex-col overflow-hidden">
               <AppHeader title={t(WEBUI.shell.configEditor)} />

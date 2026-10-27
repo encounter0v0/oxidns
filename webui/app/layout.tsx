@@ -4,6 +4,7 @@ import { ThemeProvider } from "@/components/theme-provider";
 import { zhCNWebui } from "@/lib/i18n/locales/zh-CN/webui";
 import { I18nProvider } from "@/lib/i18n/provider";
 import { ToastProvider } from "@/components/ui/toast";
+import { WallpaperBackground } from "@/components/theme/wallpaper-background";
 
 export const metadata: Metadata = {
   title: zhCNWebui.metadata.title,
@@ -41,13 +42,14 @@ export default function RootLayout({
       lang="zh-CN"
       suppressHydrationWarning
     >
-      <body className="antialiased bg-background font-sans selection:bg-primary/20">
+      <body className="antialiased bg-transparent font-sans selection:bg-primary/20 min-h-screen relative overflow-x-hidden">
         <ThemeProvider
           attribute="class"
           defaultTheme="system"
           enableSystem
           disableTransitionOnChange
         >
+          <WallpaperBackground />
           <I18nProvider>
             <ToastProvider>{children}</ToastProvider>
           </I18nProvider>
