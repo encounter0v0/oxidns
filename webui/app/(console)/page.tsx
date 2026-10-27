@@ -127,11 +127,6 @@ export default function DashboardPage() {
               <span>系统与插件拓扑</span>
             </button>
           </div>
-
-          <div className="hidden sm:flex items-center gap-2 text-xs text-muted-foreground">
-            <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
-            <span>Liquid Glass 液态玻璃控制台</span>
-          </div>
         </div>
 
         {dashboardTab === "dns" ? (

@@ -21,12 +21,12 @@ export function WallpaperBackground() {
   // Sync liquid glass optical physics parameters to document root CSS variables
   useEffect(() => {
     const root = document.documentElement;
-    const blurPx = blurLevel === "low" ? "16px" : blurLevel === "high" ? "42px" : "28px";
+    const blurPx = blurLevel === "low" ? "18px" : blurLevel === "high" ? "50px" : "36px";
     root.style.setProperty("--glass-blur", blurPx);
 
     if (chromaticAberration) {
-      root.style.setProperty("--glass-aberration-cyan", "rgba(56, 189, 248, 0.16)");
-      root.style.setProperty("--glass-aberration-rose", "rgba(244, 63, 94, 0.14)");
+      root.style.setProperty("--glass-aberration-cyan", "rgba(56, 189, 248, 0.26)");
+      root.style.setProperty("--glass-aberration-rose", "rgba(244, 63, 94, 0.22)");
     } else {
       root.style.setProperty("--glass-aberration-cyan", "transparent");
       root.style.setProperty("--glass-aberration-rose", "transparent");

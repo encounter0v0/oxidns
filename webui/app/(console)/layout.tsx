@@ -164,7 +164,7 @@ export default function ConsoleLayout({
         }}
       >
         <AppSidebar />
-        <SidebarInset className="h-svh min-h-0 overflow-hidden md:h-[calc(100svh-1.5rem)] md:my-3 md:mr-3 rounded-2xl bg-transparent">
+        <SidebarInset className="h-svh min-h-0 overflow-hidden md:h-[calc(100svh-1.25rem)] md:my-2.5 md:mr-2.5 md:ml-1 rounded-2xl liquid-glass-panel shadow-2xl border border-white/30 dark:border-white/10 bg-transparent flex flex-col">
           {editorMode ? (
             <div className="flex h-full min-h-0 flex-col overflow-hidden">
               <AppHeader title={t(WEBUI.shell.configEditor)} />

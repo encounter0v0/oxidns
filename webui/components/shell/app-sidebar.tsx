@@ -70,17 +70,14 @@ export function AppSidebar() {
   const isOfflineMode = useAppStore((s) => s.isOfflineMode);
 
   return (
-    <Sidebar
-      variant="inset"
-      className="liquid-glass-sidebar md:m-3 md:h-[calc(100svh-1.5rem)] rounded-2xl overflow-hidden shadow-xl border border-white/30 dark:border-white/10"
-    >
+    <Sidebar variant="inset" className="bg-transparent">
       {/* Brand Header */}
-      <SidebarHeader className="h-16 justify-center border-b border-border/40 px-4">
+      <SidebarHeader className="h-16 justify-center border-b border-white/20 dark:border-white/10 px-4">
         <SidebarMenu>
           <SidebarMenuItem>
-            <SidebarMenuButton asChild className="h-10 rounded-2xl px-2.5 hover:bg-sidebar-accent/50 transition-all">
-              <Link href="/">
-                <div className="relative size-8 shrink-0 flex items-center justify-center rounded-xl bg-primary/10 border border-primary/20">
+            <SidebarMenuButton asChild className="h-11 rounded-xl px-2.5 hover:bg-white/10 dark:hover:bg-white/5 transition-all">
+              <Link href="/" className="flex items-center gap-2.5">
+                <div className="relative size-8 shrink-0 flex items-center justify-center rounded-xl bg-primary/10 border border-primary/20 shadow-xs">
                   <Image
                     src="/logo-light.png"
                     alt="OxiDNS"
@@ -98,17 +95,9 @@ export function AppSidebar() {
                     priority
                   />
                 </div>
-                <div className="flex flex-col gap-0.5 leading-none">
-                  <div className="flex items-center gap-1.5">
-                    <span className="font-bold text-sm tracking-tight text-foreground">OxiDNS</span>
-                    <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-primary/15 text-primary font-mono font-semibold">
-                      Console
-                    </span>
-                  </div>
-                  <span className="text-[11px] text-muted-foreground">
-                    DNS 策略编排引擎
-                  </span>
-                </div>
+                <span className="font-bold text-base tracking-tight text-foreground">
+                  OxiDNS
+                </span>
               </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>

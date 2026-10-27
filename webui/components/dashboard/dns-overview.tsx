@@ -544,7 +544,7 @@ export function DnsOverview() {
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <div className="flex items-center gap-2.5">
-            <h1 className="text-2xl font-bold tracking-tight text-foreground">DNS 监控总览</h1>
+            <h2 className="text-xl font-bold tracking-tight text-foreground">实时指标与策略监控</h2>
             <span className="liquid-glass-pill bg-foreground/[0.04] text-foreground/80 border border-foreground/[0.08]">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
               {health?.status === "ok" ? "引擎运行正常" : "高可用守护中"}
