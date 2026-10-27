@@ -8,6 +8,11 @@
 
 [中文](README.md) | [English](README_EN.md) · [文档](https://oxidns.org/) · [快速开始](https://oxidns.org/quickstart) · [插件参考](https://oxidns.org/plugin-reference/overview)
 
+**修改特点：
+1.玻璃特效
+2.增加监控总览**
+<img width="2549" height="2156" alt="image" src="https://github.com/user-attachments/assets/9f164e4e-7546-4352-aa27-a77305971ad6" />
+
 # OxiDNS
 
 **面向复杂网络的高性能 DNS 策略编排引擎。**
