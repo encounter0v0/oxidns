@@ -39,6 +39,10 @@ import { useI18n } from "@/lib/i18n/provider";
 import { cn } from "@/lib/utils";
 import {
   fetchQueryRecorderTimeseries,
+  fetchQueryRecorderTopClients,
+  fetchQueryRecorderTopQnames,
+  fetchQueryRecords,
+  type QueryRecordRow,
 } from "@/lib/oxidns-api";
 
 // --- Types ---
@@ -105,51 +109,6 @@ interface LiveQueryLog {
   upstream?: string;
 }
 
-// Generate high-fidelity realistic telemetry when recorder data is ramping up or offline
-function generateRealisticTimeseries(range: TimeRange): TrafficPoint[] {
-  const points: TrafficPoint[] = [];
-  const now = Date.now();
-  const count = range === "live" ? 24 : range === "1h" ? 20 : range === "6h" ? 24 : 24;
-  const stepMs =
-    range === "live"
-      ? 5000
-      : range === "1h"
-        ? 3 * 60 * 1000
-        : range === "6h"
-          ? 15 * 60 * 1000
-          : 60 * 60 * 1000;
-
-  for (let i = count - 1; i >= 0; i--) {
-    const t = new Date(now - i * stepMs);
-    const timeStr =
-      range === "live"
-        ? `${t.getMinutes().toString().padStart(2, "0")}:${t.getSeconds().toString().padStart(2, "0")}`
-        : `${t.getHours().toString().padStart(2, "0")}:${t.getMinutes().toString().padStart(2, "0")}`;
-
-    // Natural diurnal curve with slight jitter
-    const hour = t.getHours();
-    const diurnalFactor = 0.4 + 0.6 * Math.sin(((hour - 4) / 24) * Math.PI);
-    const baseQueries = Math.round(180 + 320 * diurnalFactor + (Math.random() * 80 - 40));
-    const cachedRatio = 0.58 + Math.random() * 0.12;
-    const blockedRatio = 0.16 + Math.random() * 0.08;
-    const cached = Math.round(baseQueries * cachedRatio);
-    const blocked = Math.round(baseQueries * blockedRatio);
-    const forwarded = Math.max(0, baseQueries - cached - blocked);
-    const qps = Number(((baseQueries / (stepMs / 1000)) * (range === "live" ? 1 : 0.08)).toFixed(1));
-
-    points.push({
-      time: timeStr,
-      timestamp: t.getTime(),
-      total: baseQueries,
-      cached,
-      blocked,
-      forwarded,
-      qps: qps > 0 ? qps : Math.round(baseQueries / 10),
-    });
-  }
-  return points;
-}
-
 // Refined modern liquid glass palette: 60-30-10 rule with muted semantic indicators
 const DEFAULT_RCODES: RcodeDist[] = [
   { name: "NOERROR (正常)", value: 71420, color: "#10b981", pct: 72.8 },
@@ -208,74 +167,6 @@ const DEFAULT_UPSTREAMS: UpstreamMetric[] = [
   },
 ];
 
-const DEFAULT_TOP_QNAMES: TopItem[] = [
-  { rank: 1, name: "api.weixin.qq.com", count: 18450, percentage: 14.2, category: "即时通讯 / 微信" },
-  { rank: 2, name: "gateway.icloud.com", count: 14210, percentage: 10.9, category: "苹果系统服务" },
-  { rank: 3, name: "p16-sign.douyin.com", count: 11840, percentage: 9.1, category: "字节跳动 CDN" },
-  { rank: 4, name: "static.zhihu.com", count: 9650, percentage: 7.4, category: "知乎静态资源" },
-  { rank: 5, name: "init.ess.apple.com", count: 8320, percentage: 6.4, category: "苹果系统服务" },
-  { rank: 6, name: "api.github.com", count: 6540, percentage: 5.0, category: "开发者服务" },
-  { rank: 7, name: "bilibili.com", count: 5890, percentage: 4.5, category: "音视频媒体" },
-  { rank: 8, name: "taobao.com", count: 5210, percentage: 4.0, category: "电子商务" },
-  { rank: 9, name: "v20.events.data.microsoft.com", count: 4890, percentage: 3.8, category: "微软系统服务" },
-  { rank: 10, name: "ntp.aliyun.com", count: 3950, percentage: 3.0, category: "时间校准" },
-];
-
-const DEFAULT_TOP_BLOCKED: TopItem[] = [
-  { rank: 1, name: "adservice.google.com", count: 8940, percentage: 24.5, ruleTag: "adguard.txt" },
-  { rank: 2, name: "e.qq.com", count: 6810, percentage: 18.7, ruleTag: "category-ads-all" },
-  { rank: 3, name: "log.byteoversea.com", count: 4520, percentage: 12.4, ruleTag: "abp_big.txt" },
-  { rank: 4, name: "app-measurement.com", count: 3890, percentage: 10.7, ruleTag: "adguard.txt" },
-  { rank: 5, name: "telemetry.sdk.mob.com", count: 2940, percentage: 8.1, ruleTag: "win-spy" },
-  { rank: 6, name: "ad.xiaomi.com", count: 2450, percentage: 6.7, ruleTag: "category-ads-all" },
-  { rank: 7, name: "trace.qq.com", count: 2110, percentage: 5.8, ruleTag: "abp_big.txt" },
-  { rank: 8, name: "atanx.alicdn.com", count: 1840, percentage: 5.0, ruleTag: "adguard.txt" },
-  { rank: 9, name: "pos.baidu.com", count: 1530, percentage: 4.2, ruleTag: "category-ads-all" },
-  { rank: 10, name: "sensorsdata.cn", count: 1450, percentage: 3.9, ruleTag: "abp_big.txt" },
-];
-
-const DEFAULT_TOP_CLIENTS: TopItem[] = [
-  { rank: 1, name: "192.168.1.102 (MacBook Pro M3 Max)", ip: "192.168.1.102", count: 48520, percentage: 37.4 },
-  { rank: 2, name: "192.168.1.108 (iPhone 16 Pro)", ip: "192.168.1.108", count: 32410, percentage: 25.0 },
-  { rank: 3, name: "192.168.1.200 (Synology NAS)", ip: "192.168.1.200", count: 18940, percentage: 14.6 },
-  { rank: 4, name: "192.168.1.115 (iPad Pro)", ip: "192.168.1.115", count: 12840, percentage: 9.9 },
-  { rank: 5, name: "192.168.1.50 (Apple TV 4K)", ip: "192.168.1.50", count: 9420, percentage: 7.3 },
-  { rank: 6, name: "192.168.1.1 (Gateway & Router)", ip: "192.168.1.1", count: 7580, percentage: 5.8 },
-];
-
-const INITIAL_LOGS: LiveQueryLog[] = [
-  { id: "1", time: "13:52:14", qname: "api.weixin.qq.com", qtype: "A", clientIp: "192.168.1.108", status: "cached", latencyMs: 0.1 },
-  { id: "2", time: "13:52:15", qname: "adservice.google.com", qtype: "A", clientIp: "192.168.1.102", status: "blocked", latencyMs: 0.2 },
-  { id: "3", time: "13:52:16", qname: "doh.pub", qtype: "AAAA", clientIp: "192.168.1.102", status: "success", latencyMs: 3.4, upstream: "doh.pub" },
-  { id: "4", time: "13:52:17", qname: "gateway.icloud.com", qtype: "HTTPS", clientIp: "192.168.1.108", status: "cached", latencyMs: 0.2 },
-  { id: "5", time: "13:52:18", qname: "e.qq.com", qtype: "A", clientIp: "192.168.1.102", status: "blocked", latencyMs: 0.1 },
-  { id: "6", time: "13:52:19", qname: "api.github.com", qtype: "A", clientIp: "192.168.1.200", status: "success", latencyMs: 5.6, upstream: "dns.alidns.com" },
-  { id: "7", time: "13:52:20", qname: "static.zhihu.com", qtype: "A", clientIp: "192.168.1.115", status: "cached", latencyMs: 0.1 },
-];
-
-const INITIAL_TIMESERIES_POINTS: TrafficPoint[] = [
-  { time: "13:00", timestamp: 1700000000000, total: 320, cached: 185, blocked: 52, forwarded: 83, qps: 8.5 },
-  { time: "13:03", timestamp: 1700000180000, total: 345, cached: 202, blocked: 56, forwarded: 87, qps: 9.2 },
-  { time: "13:06", timestamp: 1700000360000, total: 360, cached: 215, blocked: 60, forwarded: 85, qps: 9.6 },
-  { time: "13:09", timestamp: 1700000540000, total: 390, cached: 232, blocked: 65, forwarded: 93, qps: 10.4 },
-  { time: "13:12", timestamp: 1700000720000, total: 420, cached: 254, blocked: 72, forwarded: 94, qps: 11.2 },
-  { time: "13:15", timestamp: 1700000900000, total: 450, cached: 275, blocked: 78, forwarded: 97, qps: 12.0 },
-  { time: "13:18", timestamp: 1700001080000, total: 475, cached: 290, blocked: 82, forwarded: 103, qps: 12.6 },
-  { time: "13:21", timestamp: 1700001260000, total: 510, cached: 312, blocked: 88, forwarded: 110, qps: 13.5 },
-  { time: "13:24", timestamp: 1700001440000, total: 530, cached: 325, blocked: 91, forwarded: 114, qps: 14.1 },
-  { time: "13:27", timestamp: 1700001620000, total: 560, cached: 345, blocked: 98, forwarded: 117, qps: 14.8 },
-  { time: "13:30", timestamp: 1700001800000, total: 590, cached: 362, blocked: 102, forwarded: 126, qps: 15.7 },
-  { time: "13:33", timestamp: 1700001980000, total: 575, cached: 350, blocked: 99, forwarded: 126, qps: 15.3 },
-  { time: "13:36", timestamp: 1700002160000, total: 550, cached: 335, blocked: 94, forwarded: 121, qps: 14.6 },
-  { time: "13:39", timestamp: 1700002340000, total: 520, cached: 318, blocked: 89, forwarded: 113, qps: 13.8 },
-  { time: "13:42", timestamp: 1700002520000, total: 495, cached: 302, blocked: 85, forwarded: 108, qps: 13.1 },
-  { time: "13:45", timestamp: 1700002700000, total: 470, cached: 285, blocked: 80, forwarded: 105, qps: 12.5 },
-  { time: "13:48", timestamp: 1700002880000, total: 445, cached: 270, blocked: 76, forwarded: 99, qps: 11.8 },
-  { time: "13:51", timestamp: 1700003060000, total: 420, cached: 255, blocked: 72, forwarded: 93, qps: 11.2 },
-  { time: "13:54", timestamp: 1700003240000, total: 395, cached: 240, blocked: 68, forwarded: 87, qps: 10.5 },
-  { time: "13:57", timestamp: 1700003420000, total: 380, cached: 230, blocked: 65, forwarded: 85, qps: 10.1 },
-];
-
 export function DnsOverview() {
   const { formatNumber } = useI18n();
   const trafficMetrics = useAppStore((s) => s.trafficMetrics);
@@ -288,8 +179,11 @@ export function DnsOverview() {
   const [isAutoRefresh, setIsAutoRefresh] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [activeDistTab, setActiveDistTab] = useState<"protocol" | "qtype">("protocol");
-  const [timeseriesData, setTimeseriesData] = useState<TrafficPoint[]>(INITIAL_TIMESERIES_POINTS);
-  const [liveLogs, setLiveLogs] = useState<LiveQueryLog[]>(INITIAL_LOGS);
+  const [timeseriesData, setTimeseriesData] = useState<TrafficPoint[]>([]);
+  const [topClients, setTopClients] = useState<TopItem[]>([]);
+  const [topQueries, setTopQueries] = useState<TopItem[]>([]);
+  const [topBlocked, setTopBlocked] = useState<TopItem[]>([]);
+  const [liveLogs, setLiveLogs] = useState<LiveQueryLog[]>([]);
   const [, setCopiedDomain] = useState<string | null>(null);
 
   // Query tester modal / dialog state
@@ -313,7 +207,11 @@ export function DnsOverview() {
   // Load real telemetry from query_recorder if backend is active
   const loadRecorderData = useCallback(async () => {
     if (!isConnected || !recorderPlugin) {
-      setTimeseriesData(generateRealisticTimeseries(timeRange));
+      setTimeseriesData([]);
+      setTopClients([]);
+      setTopQueries([]);
+      setTopBlocked([]);
+      setLiveLogs([]);
       return;
     }
     try {
@@ -322,8 +220,11 @@ export function DnsOverview() {
       const bucket = timeRange === "24h" ? "hour" : "minute";
       const buckets = timeRange === "live" ? 24 : timeRange === "1h" ? 20 : 24;
 
-      const [tsRes] = await Promise.allSettled([
+      const [tsRes, clientsRes, qnamesRes, recordsRes] = await Promise.allSettled([
         fetchQueryRecorderTimeseries(tag, { bucket, buckets }),
+        fetchQueryRecorderTopClients(tag, { limit: 6 }),
+        fetchQueryRecorderTopQnames(tag, { limit: 7 }),
+        fetchQueryRecords(tag, { limit: 8 }),
       ]);
 
       if (tsRes.status === "fulfilled" && tsRes.value.ok && tsRes.value.points?.length > 0) {
@@ -341,10 +242,64 @@ export function DnsOverview() {
         }));
         setTimeseriesData(mapped);
       } else {
-        setTimeseriesData(generateRealisticTimeseries(timeRange));
+        setTimeseriesData([]);
+      }
+
+      if (clientsRes.status === "fulfilled" && clientsRes.value.ok && clientsRes.value.rows?.length > 0) {
+        const totalSample = clientsRes.value.sample_size || clientsRes.value.rows.reduce((acc, r) => acc + r.count, 0) || 1;
+        setTopClients(
+          clientsRes.value.rows.map((row, idx) => ({
+            rank: idx + 1,
+            name: row.key,
+            ip: row.key,
+            count: row.count,
+            percentage: Number(((row.count / totalSample) * 100).toFixed(1)),
+          })),
+        );
+      } else {
+        setTopClients([]);
+      }
+
+      if (qnamesRes.status === "fulfilled" && qnamesRes.value.ok && qnamesRes.value.rows?.length > 0) {
+        const totalSample = qnamesRes.value.sample_size || qnamesRes.value.rows.reduce((acc, r) => acc + r.count, 0) || 1;
+        setTopQueries(
+          qnamesRes.value.rows.map((row, idx) => ({
+            rank: idx + 1,
+            name: row.key,
+            count: row.count,
+            percentage: Number(((row.count / totalSample) * 100).toFixed(1)),
+            category: "域名解析",
+          })),
+        );
+      } else {
+        setTopQueries([]);
+      }
+
+      if (recordsRes.status === "fulfilled" && recordsRes.value.ok && recordsRes.value.records?.length > 0) {
+        setLiveLogs(
+          recordsRes.value.records.map((r: QueryRecordRow) => {
+            const qname = r.questions_json?.[0]?.name || "unknown";
+            const qtype = r.questions_json?.[0]?.qtype || "A";
+            const isBlocked = r.rcode === "NXDOMAIN" || r.rcode === "REFUSED" || Boolean(r.error);
+            const isCached = r.elapsed_ms < 1.0;
+            const time = new Date(r.created_at_ms).toTimeString().split(" ")[0];
+            return {
+              id: String(r.id),
+              time,
+              qname,
+              qtype,
+              clientIp: r.client_ip,
+              status: isBlocked ? "blocked" : isCached ? "cached" : "success",
+              latencyMs: Number(r.elapsed_ms.toFixed(1)),
+              upstream: isBlocked || isCached ? undefined : "upstream",
+            };
+          }),
+        );
+      } else {
+        setLiveLogs([]);
       }
     } catch {
-      setTimeseriesData(generateRealisticTimeseries(timeRange));
+      // ignore
     } finally {
       setIsRefreshing(false);
     }
@@ -355,60 +310,15 @@ export function DnsOverview() {
     void loadRecorderData();
   }, [loadRecorderData]);
 
-  // Live timer tick for real-time scrolling and simulated incoming query feed
+  // Periodic polling for real query telemetry when connected and recorder is active
   useEffect(() => {
-    if (!isAutoRefresh) return;
+    if (!isAutoRefresh || !isConnected || !recorderPlugin) return;
     const interval = setInterval(() => {
-      if (timeRange === "live") {
-        setTimeseriesData((prev) => {
-          const now = new Date();
-          const timeStr = `${now.getMinutes().toString().padStart(2, "0")}:${now.getSeconds().toString().padStart(2, "0")}`;
-          const total = Math.round(20 + Math.random() * 35);
-          const cached = Math.round(total * (0.6 + Math.random() * 0.15));
-          const blocked = Math.round(total * (0.15 + Math.random() * 0.1));
-          const forwarded = Math.max(0, total - cached - blocked);
-          const newPoint: TrafficPoint = {
-            time: timeStr,
-            timestamp: now.getTime(),
-            total,
-            cached,
-            blocked,
-            forwarded,
-            qps: Number((total / 5).toFixed(1)),
-          };
-          return [...prev.slice(1), newPoint];
-        });
-      }
-
-      const domains = [
-        "doh.pub",
-        "api.weixin.qq.com",
-        "gateway.icloud.com",
-        "adservice.google.com",
-        "p16-sign.douyin.com",
-        "e.qq.com",
-        "static.zhihu.com",
-        "api.github.com",
-      ];
-      const randomDomain = domains[Math.floor(Math.random() * domains.length)];
-      const isBlocked = randomDomain.includes("adservice") || randomDomain.includes("e.qq.com");
-      const isCached = !isBlocked && Math.random() > 0.4;
-      const now = new Date();
-      const newLog: LiveQueryLog = {
-        id: Math.random().toString(36).slice(2, 9),
-        time: now.toTimeString().split(" ")[0],
-        qname: randomDomain,
-        qtype: Math.random() > 0.3 ? "A" : "AAAA",
-        clientIp: Math.random() > 0.5 ? "192.168.1.102" : "192.168.1.108",
-        status: isBlocked ? "blocked" : isCached ? "cached" : "success",
-        latencyMs: isBlocked ? 0.2 : isCached ? 0.1 : Number((2 + Math.random() * 6).toFixed(1)),
-        upstream: isBlocked || isCached ? undefined : "doh.pub",
-      };
-      setLiveLogs((prev) => [newLog, ...prev.slice(0, 7)]);
-    }, timeRange === "live" ? 3000 : 6000);
+      void loadRecorderData();
+    }, 4000);
 
     return () => clearInterval(interval);
-  }, [isAutoRefresh, timeRange]);
+  }, [isAutoRefresh, isConnected, recorderPlugin, loadRecorderData]);
 
   // Derived KPI metrics
   const totalQueries = useMemo(() => {
@@ -1052,45 +962,51 @@ export function DnsOverview() {
           </div>
 
           <div className="space-y-2">
-            {DEFAULT_TOP_QNAMES.slice(0, 7).map((item) => (
-              <div
-                key={item.name}
-                className="group flex items-center justify-between p-2 rounded-lg hover:bg-foreground/[0.04] transition-all text-xs"
-              >
-                <div className="flex items-center gap-2.5 min-w-0">
-                  <span
-                    className={cn(
-                      "h-5 w-5 rounded-md flex items-center justify-center font-mono font-bold text-[10px] shrink-0",
-                      item.rank <= 3
-                        ? "bg-foreground/[0.08] text-foreground font-semibold"
-                        : "bg-foreground/[0.03] text-muted-foreground",
-                    )}
-                  >
-                    {item.rank}
-                  </span>
-                  <div className="min-w-0">
-                    <div className="font-mono text-foreground font-medium truncate max-w-[140px]" title={item.name}>
-                      {item.name}
+            {topQueries.length > 0 ? (
+              topQueries.slice(0, 7).map((item) => (
+                <div
+                  key={item.name}
+                  className="group flex items-center justify-between p-2 rounded-lg hover:bg-foreground/[0.04] transition-all text-xs"
+                >
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span
+                      className={cn(
+                        "h-5 w-5 rounded-md flex items-center justify-center font-mono font-bold text-[10px] shrink-0",
+                        item.rank <= 3
+                          ? "bg-foreground/[0.08] text-foreground font-semibold"
+                          : "bg-foreground/[0.03] text-muted-foreground",
+                      )}
+                    >
+                      {item.rank}
+                    </span>
+                    <div className="min-w-0">
+                      <div className="font-mono text-foreground font-medium truncate max-w-[140px]" title={item.name}>
+                        {item.name}
+                      </div>
+                      <div className="text-[10px] text-muted-foreground truncate">{item.category || "域名解析"}</div>
                     </div>
-                    <div className="text-[10px] text-muted-foreground truncate">{item.category}</div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <span className="font-mono tabular-nums text-muted-foreground">
+                      {formatNumber(item.count)}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => copyText(item.name)}
+                      className="opacity-0 group-hover:opacity-100 p-1 hover:text-foreground text-muted-foreground rounded transition-opacity"
+                      title="复制域名"
+                    >
+                      <Copy className="h-3 w-3" />
+                    </button>
                   </div>
                 </div>
-
-                <div className="flex items-center gap-1.5 shrink-0">
-                  <span className="font-mono tabular-nums text-muted-foreground">
-                    {formatNumber(item.count)}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => copyText(item.name)}
-                    className="opacity-0 group-hover:opacity-100 p-1 hover:text-foreground text-muted-foreground rounded transition-opacity"
-                    title="复制域名"
-                  >
-                    <Copy className="h-3 w-3" />
-                  </button>
-                </div>
+              ))
+            ) : (
+              <div className="py-8 text-center text-xs text-muted-foreground/60">
+                暂无请求域名数据
               </div>
-            ))}
+            )}
           </div>
         </div>
 
@@ -1107,40 +1023,46 @@ export function DnsOverview() {
           </div>
 
           <div className="space-y-2">
-            {DEFAULT_TOP_BLOCKED.slice(0, 7).map((item) => (
-              <div
-                key={item.name}
-                className="group flex items-center justify-between p-2 rounded-lg hover:bg-foreground/[0.04] transition-all text-xs"
-              >
-                <div className="flex items-center gap-2.5 min-w-0">
-                  <span className="h-5 w-5 rounded-md bg-rose-500/10 text-rose-600 dark:text-rose-400 flex items-center justify-center font-mono font-bold text-[10px] shrink-0">
-                    {item.rank}
-                  </span>
-                  <div className="min-w-0">
-                    <div className="font-mono text-foreground font-medium truncate max-w-[140px]" title={item.name}>
-                      {item.name}
-                    </div>
-                    <div className="text-[10px] text-muted-foreground font-mono truncate">
-                      {item.ruleTag}
+            {topBlocked.length > 0 ? (
+              topBlocked.slice(0, 7).map((item) => (
+                <div
+                  key={item.name}
+                  className="group flex items-center justify-between p-2 rounded-lg hover:bg-foreground/[0.04] transition-all text-xs"
+                >
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span className="h-5 w-5 rounded-md bg-rose-500/10 text-rose-600 dark:text-rose-400 flex items-center justify-center font-mono font-bold text-[10px] shrink-0">
+                      {item.rank}
+                    </span>
+                    <div className="min-w-0">
+                      <div className="font-mono text-foreground font-medium truncate max-w-[140px]" title={item.name}>
+                        {item.name}
+                      </div>
+                      <div className="text-[10px] text-muted-foreground font-mono truncate">
+                        {item.ruleTag || "规则拦截"}
+                      </div>
                     </div>
                   </div>
-                </div>
 
-                <div className="flex items-center gap-1.5 shrink-0">
-                  <span className="font-mono tabular-nums text-foreground/85 font-medium">
-                    {formatNumber(item.count)}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => copyText(item.name)}
-                    className="opacity-0 group-hover:opacity-100 p-1 hover:text-foreground text-muted-foreground rounded transition-opacity"
-                    title="复制域名"
-                  >
-                    <Copy className="h-3 w-3" />
-                  </button>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <span className="font-mono tabular-nums text-foreground/85 font-medium">
+                      {formatNumber(item.count)}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => copyText(item.name)}
+                      className="opacity-0 group-hover:opacity-100 p-1 hover:text-foreground text-muted-foreground rounded transition-opacity"
+                      title="复制域名"
+                    >
+                      <Copy className="h-3 w-3" />
+                    </button>
+                  </div>
                 </div>
+              ))
+            ) : (
+              <div className="py-8 text-center text-xs text-muted-foreground/60">
+                暂无拦截记录
               </div>
-            ))}
+            )}
           </div>
         </div>
 
@@ -1155,24 +1077,30 @@ export function DnsOverview() {
           </div>
 
           <div className="space-y-3">
-            {DEFAULT_TOP_CLIENTS.map((item) => (
-              <div key={item.ip} className="space-y-1">
-                <div className="flex items-center justify-between text-xs">
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    <span className="font-medium truncate text-foreground">{item.name}</span>
+            {topClients.length > 0 ? (
+              topClients.map((item) => (
+                <div key={item.ip || item.name} className="space-y-1">
+                  <div className="flex items-center justify-between text-xs">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="font-medium truncate text-foreground">{item.name}</span>
+                    </div>
+                    <span className="font-mono tabular-nums text-muted-foreground shrink-0">
+                      {item.percentage}%
+                    </span>
                   </div>
-                  <span className="font-mono tabular-nums text-muted-foreground shrink-0">
-                    {item.percentage}%
-                  </span>
+                  <div className="h-1.5 w-full rounded-full bg-foreground/[0.05] overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-primary"
+                      style={{ width: `${item.percentage}%` }}
+                    />
+                  </div>
                 </div>
-                <div className="h-1.5 w-full rounded-full bg-foreground/[0.05] overflow-hidden">
-                  <div
-                    className="h-full rounded-full bg-primary"
-                    style={{ width: `${item.percentage}%` }}
-                  />
-                </div>
+              ))
+            ) : (
+              <div className="py-8 text-center text-xs text-muted-foreground/60">
+                {recorderPlugin ? "暂无客户端记录" : "需在配置中启用 query_recorder 插件以统计真实客户端"}
               </div>
-            ))}
+            )}
           </div>
         </div>
       </div>
@@ -1205,37 +1133,50 @@ export function DnsOverview() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-border/20 font-mono">
-                {liveLogs.map((log) => (
-                  <tr key={log.id} className="hover:bg-foreground/[0.02] transition-colors">
-                    <td className="py-2.5 pl-1 text-muted-foreground text-[11px]">{log.time}</td>
-                    <td className="py-2.5 font-medium text-foreground max-w-[200px] truncate" title={log.qname}>
-                      {log.qname}
-                    </td>
-                    <td className="py-2.5 text-muted-foreground">{log.qtype}</td>
-                    <td className="py-2.5 text-muted-foreground">{log.clientIp}</td>
-                    <td className="py-2.5 text-muted-foreground text-[11px]">
-                      {log.upstream || (log.status === "cached" ? "local_cache" : "blackhole")}
-                    </td>
-                    <td className="py-2.5 text-[11px]">{log.latencyMs} ms</td>
-                    <td className="py-2.5 pr-1 text-right">
-                      {log.status === "cached" && (
-                        <span className="liquid-glass-pill bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 text-[10px] py-0.5">
-                          缓存命中
-                        </span>
-                      )}
-                      {log.status === "blocked" && (
-                        <span className="liquid-glass-pill bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20 text-[10px] py-0.5">
-                          规则拦截
-                        </span>
-                      )}
-                      {log.status === "success" && (
-                        <span className="liquid-glass-pill bg-foreground/[0.04] text-foreground/80 border border-foreground/[0.08] text-[10px] py-0.5">
-                          正常解析
-                        </span>
-                      )}
+                {liveLogs.length > 0 ? (
+                  liveLogs.map((log) => (
+                    <tr key={log.id} className="hover:bg-foreground/[0.02] transition-colors">
+                      <td className="py-2.5 pl-1 text-muted-foreground text-[11px]">{log.time}</td>
+                      <td className="py-2.5 font-medium text-foreground max-w-[200px] truncate" title={log.qname}>
+                        {log.qname}
+                      </td>
+                      <td className="py-2.5 text-muted-foreground">{log.qtype}</td>
+                      <td className="py-2.5 text-muted-foreground">{log.clientIp}</td>
+                      <td className="py-2.5 text-muted-foreground text-[11px]">
+                        {log.upstream || (log.status === "cached" ? "local_cache" : "blackhole")}
+                      </td>
+                      <td className="py-2.5 text-[11px]">{log.latencyMs} ms</td>
+                      <td className="py-2.5 pr-1 text-right">
+                        {log.status === "cached" && (
+                          <span className="liquid-glass-pill bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 text-[10px] py-0.5">
+                            缓存命中
+                          </span>
+                        )}
+                        {log.status === "blocked" && (
+                          <span className="liquid-glass-pill bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20 text-[10px] py-0.5">
+                            规则拦截
+                          </span>
+                        )}
+                        {log.status === "success" && (
+                          <span className="liquid-glass-pill bg-foreground/[0.04] text-foreground/80 border border-foreground/[0.08] text-[10px] py-0.5">
+                            正常解析
+                          </span>
+                        )}
+                        {log.status === "error" && (
+                          <span className="liquid-glass-pill bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20 text-[10px] py-0.5">
+                            解析异常
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan={7} className="py-8 text-center text-xs text-muted-foreground/60">
+                      {recorderPlugin ? "等待 DNS 查询流水..." : "未在配置中检测到 query_recorder 插件，暂无流水"}
                     </td>
                   </tr>
-                ))}
+                )}
               </tbody>
             </table>
           </div>

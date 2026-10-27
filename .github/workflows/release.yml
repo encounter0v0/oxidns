@@ -27,6 +27,26 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Sync Cargo version with release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.ref_name }}"
+          if [[ "$VERSION" == "main" || "$VERSION" == "master" ]]; then
+            VERSION="${{ inputs.tag_name || 'v1.6.2' }}"
+          fi
+          PLAIN_VERSION="${VERSION#v}"
+          echo "Syncing Cargo version to: $PLAIN_VERSION"
+          sed -i -E 's/^version = ".*"/version = "'"$PLAIN_VERSION"'"/' Cargo.toml
+          python3 -c "
+          with open('Cargo.lock', 'r') as f:
+              c = f.read()
+          import re
+          c = re.sub(r'(\[\[package\]\]\s+name = \"oxidns\"\s+version = )\"[^\"]+\"', r'\g<1>\"' + '$PLAIN_VERSION' + '\"', c, count=1)
+          with open('Cargo.lock', 'w') as f:
+              f.write(c)
+          " || true
+
       - name: Set up pnpm
         uses: pnpm/action-setup@v6
         with:
@@ -173,6 +193,26 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      - name: Sync Cargo version with release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.ref_name }}"
+          if [[ "$VERSION" == "main" || "$VERSION" == "master" ]]; then
+            VERSION="${{ inputs.tag_name || 'v1.6.2' }}"
+          fi
+          PLAIN_VERSION="${VERSION#v}"
+          echo "Syncing Cargo version to: $PLAIN_VERSION"
+          sed -i -E 's/^version = ".*"/version = "'"$PLAIN_VERSION"'"/' Cargo.toml
+          python3 -c "
+          with open('Cargo.lock', 'r') as f:
+              c = f.read()
+          import re
+          c = re.sub(r'(\[\[package\]\]\s+name = \"oxidns\"\s+version = )\"[^\"]+\"', r'\g<1>\"' + '$PLAIN_VERSION' + '\"', c, count=1)
+          with open('Cargo.lock', 'w') as f:
+              f.write(c)
+          " || true
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -328,6 +368,26 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Sync Cargo version with release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.ref_name }}"
+          if [[ "$VERSION" == "main" || "$VERSION" == "master" ]]; then
+            VERSION="${{ inputs.tag_name || 'v1.6.2' }}"
+          fi
+          PLAIN_VERSION="${VERSION#v}"
+          echo "Syncing Cargo version to: $PLAIN_VERSION"
+          sed -i -E 's/^version = ".*"/version = "'"$PLAIN_VERSION"'"/' Cargo.toml
+          python3 -c "
+          with open('Cargo.lock', 'r') as f:
+              c = f.read()
+          import re
+          c = re.sub(r'(\[\[package\]\]\s+name = \"oxidns\"\s+version = )\"[^\"]+\"', r'\g<1>\"' + '$PLAIN_VERSION' + '\"', c, count=1)
+          with open('Cargo.lock', 'w') as f:
+              f.write(c)
+          " || true
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -406,6 +466,26 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      - name: Sync Cargo version with release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.ref_name }}"
+          if [[ "$VERSION" == "main" || "$VERSION" == "master" ]]; then
+            VERSION="${{ inputs.tag_name || 'v1.6.2' }}"
+          fi
+          PLAIN_VERSION="${VERSION#v}"
+          echo "Syncing Cargo version to: $PLAIN_VERSION"
+          sed -i -E 's/^version = ".*"/version = "'"$PLAIN_VERSION"'"/' Cargo.toml
+          python3 -c "
+          with open('Cargo.lock', 'r') as f:
+              c = f.read()
+          import re
+          c = re.sub(r'(\[\[package\]\]\s+name = \"oxidns\"\s+version = )\"[^\"]+\"', r'\g<1>\"' + '$PLAIN_VERSION' + '\"', c, count=1)
+          with open('Cargo.lock', 'w') as f:
+              f.write(c)
+          " || true
 
       - name: Download all release artifacts
         uses: actions/download-artifact@v8
