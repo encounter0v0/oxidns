@@ -37,6 +37,7 @@ import { useAppStore } from "@/lib/store";
 import { useAuthStore } from "@/lib/auth-store";
 import { useI18n } from "@/lib/i18n/provider";
 import { cn } from "@/lib/utils";
+import type { MetricSeries } from "@/lib/metrics";
 import {
   fetchQueryRecorderTimeseries,
   fetchQueryRecorderTopClients,
@@ -161,34 +162,58 @@ export function DnsOverview() {
       const cfg = p.config as { upstreams?: Array<{ addr?: string; tag?: string } | string> };
       if (!Array.isArray(cfg?.upstreams)) continue;
 
-      const series = pluginMetrics[p.name] || [];
+      const directSeries = pluginMetrics[p.name] || [];
+      const allSeries = Object.values(pluginMetrics).flat();
+      const series = directSeries.length > 0 ? directSeries : allSeries;
 
-      for (const u of cfg.upstreams) {
+      for (let uIdx = 0; uIdx < cfg.upstreams.length; uIdx++) {
+        const u = cfg.upstreams[uIdx];
         const addr = typeof u === "string" ? u : u.addr || "";
         if (!addr) continue;
-        const tag = typeof u === "object" && u.tag ? u.tag : p.name;
-        const name = typeof u === "object" && u.tag ? `${u.tag} (${addr})` : addr;
+        const tag = typeof u === "object" && u.tag ? u.tag : "";
+        const name = tag ? `${tag} (${addr})` : addr;
 
-        const qSeries = series.find(
-          (s) =>
-            s.name === "forward_upstream_query_total" &&
-            (s.labels.upstream === addr || s.labels.target === addr),
+        // In Rust ForwardMetrics (src/plugin/executor/forward/metrics.rs):
+        // `base = info.tag.clone().unwrap_or_else(|| info.raw_addr.clone());`
+        // `name = if names.contains(&base) { format!("{}#{}", base, idx) } else { base };`
+        // `labels = [MetricLabel::new("plugin_tag", self.tag), MetricLabel::new("upstream", up.name)]`
+        const matchUpstream = (s: MetricSeries) => {
+          const upLabel = (s.labels.upstream || s.labels.target || "").toLowerCase();
+          if (!upLabel) return false;
+          const targetTag = tag.toLowerCase();
+          const targetAddr = addr.toLowerCase();
+          return (
+            (Boolean(targetTag) &&
+              (upLabel === targetTag ||
+                upLabel === `${targetTag}#${uIdx}` ||
+                upLabel.startsWith(`${targetTag}#`))) ||
+            upLabel === targetAddr ||
+            upLabel === `${targetAddr}#${uIdx}` ||
+            upLabel.startsWith(`${targetAddr}#`)
+          );
+        };
+
+        let qSeries = series.find(
+          (s) => s.name === "forward_upstream_query_total" && matchUpstream(s),
         );
-        const sSeries = series.find(
-          (s) =>
-            s.name === "forward_upstream_success_total" &&
-            (s.labels.upstream === addr || s.labels.target === addr),
+        let sSeries = series.find(
+          (s) => s.name === "forward_upstream_success_total" && matchUpstream(s),
         );
-        const lSum = series.find(
-          (s) =>
-            s.name === "forward_upstream_latency_sum_ms" &&
-            (s.labels.upstream === addr || s.labels.target === addr),
+        let lSum = series.find(
+          (s) => s.name === "forward_upstream_latency_sum_ms" && matchUpstream(s),
         );
-        const lCount = series.find(
-          (s) =>
-            s.name === "forward_upstream_latency_count" &&
-            (s.labels.upstream === addr || s.labels.target === addr),
+        let lCount = series.find(
+          (s) => s.name === "forward_upstream_latency_count" && matchUpstream(s),
         );
+
+        // If only 1 upstream configured in this forward plugin and no specific upstream metric matched,
+        // fall back to overall forward plugin query metrics
+        if (!qSeries && cfg.upstreams.length === 1) {
+          qSeries = series.find((s) => s.name === "forward_query_total");
+          sSeries = series.find((s) => s.name === "forward_success_total");
+          lSum = series.find((s) => s.name === "forward_latency_sum_ms");
+          lCount = series.find((s) => s.name === "forward_latency_count");
+        }
 
         const queries = qSeries?.value ?? 0;
         const success = sSeries?.value ?? 0;
@@ -198,7 +223,7 @@ export function DnsOverview() {
         const successRate = queries > 0 ? Number(((success / queries) * 100).toFixed(1)) : 100;
 
         list.push({
-          tag,
+          tag: tag || p.name,
           name,
           addr,
           queries,
@@ -1099,11 +1124,11 @@ export function DnsOverview() {
                   className="p-3.5 rounded-xl border border-border/40 bg-foreground/[0.02] hover:bg-foreground/[0.04] transition-all space-y-2.5"
                 >
                   <div className="flex items-start justify-between">
-                    <div>
-                      <h4 className="text-xs font-semibold text-foreground truncate max-w-[160px]" title={ups.name}>
-                        {ups.name}
+                    <div className="min-w-0 pr-2">
+                      <h4 className="text-xs font-semibold text-foreground truncate" title={ups.name}>
+                        {ups.tag || ups.name}
                       </h4>
-                      <p className="text-[11px] text-muted-foreground font-mono truncate max-w-[160px]" title={ups.addr}>
+                      <p className="text-[11px] text-muted-foreground font-mono truncate" title={ups.addr}>
                         {ups.addr}
                       </p>
                     </div>
