@@ -26,6 +26,7 @@ import { useAppStore } from "@/lib/store";
 import { useAuthStore } from "@/lib/auth-store";
 import { useUpdateStore } from "@/lib/update-store";
 import { ConfigSyncControl } from "@/components/config/config-sync-status";
+import { WallpaperSwitcher } from "@/components/theme/wallpaper-switcher";
 import {
   Tooltip,
   TooltipContent,
@@ -143,6 +144,9 @@ export function AppHeader({ title, breadcrumbs = [] }: AppHeaderProps) {
             </TooltipContent>
           </Tooltip>
         )}
+
+        {/* Liquid Glass Wallpaper & Refraction Switcher */}
+        {mounted && <WallpaperSwitcher />}
 
         {/* macOS Control Center Segmented Theme Switcher */}
         {mounted && (
