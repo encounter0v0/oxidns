@@ -44,8 +44,10 @@ import {
   fetchQueryRecorderTopQnames,
   fetchQueryRecorderRcodeDistribution,
   fetchQueryRecorderQtypeDistribution,
+  fetchQueryRecorderLatency,
   fetchQueryRecords,
   type QueryRecordRow,
+  type QueryRecorderLatencySummary,
 } from "@/lib/oxidns-api";
 
 // --- Types ---
@@ -55,9 +57,10 @@ interface TrafficPoint {
   time: string;
   timestamp: number;
   total: number;
-  cached: number;
+  success: number;
   blocked: number;
-  forwarded: number;
+  avgMs: number;
+  p95Ms: number;
   qps: number;
 }
 
@@ -133,6 +136,7 @@ export function DnsOverview() {
   const [liveLogs, setLiveLogs] = useState<LiveQueryLog[]>([]);
   const [rcodes, setRcodes] = useState<RcodeDist[]>([]);
   const [qtypes, setQtypes] = useState<QtypeDist[]>([]);
+  const [recorderLatency, setRecorderLatency] = useState<QueryRecorderLatencySummary | null>(null);
   const [, setCopiedDomain] = useState<string | null>(null);
 
   // Query tester modal / dialog state
@@ -272,24 +276,55 @@ export function DnsOverview() {
       setLiveLogs([]);
       setRcodes([]);
       setQtypes([]);
+      setRecorderLatency(null);
       return;
     }
     try {
       setIsRefreshing(true);
       const tag = recorderPlugin.name || recorderPlugin.id;
-      const bucket = timeRange === "24h" ? "hour" : "minute";
-      const buckets = timeRange === "live" ? 24 : timeRange === "1h" ? 20 : 24;
 
-      const [tsRes, clientsRes, qnamesRes, recordsRes, rcodeRes, qtypeRes] = await Promise.allSettled([
-        fetchQueryRecorderTimeseries(tag, { bucket, buckets }),
-        fetchQueryRecorderTopClients(tag, { limit: 6 }),
-        fetchQueryRecorderTopQnames(tag, { limit: 7 }),
-        fetchQueryRecords(tag, { limit: 8 }),
-        fetchQueryRecorderRcodeDistribution(tag),
-        fetchQueryRecorderQtypeDistribution(tag),
+      const now = Date.now();
+      let sinceMs: number;
+      let bucket: "minute" | "hour" = "minute";
+      let buckets = 60;
+
+      if (timeRange === "1h") {
+        sinceMs = now - 60 * 60 * 1000;
+        bucket = "minute";
+        buckets = 60;
+      } else if (timeRange === "6h") {
+        sinceMs = now - 6 * 60 * 60 * 1000;
+        bucket = "minute";
+        buckets = 360;
+      } else if (timeRange === "24h") {
+        sinceMs = now - 24 * 60 * 60 * 1000;
+        bucket = "hour";
+        buckets = 24;
+      } else {
+        // live (15 min)
+        sinceMs = now - 15 * 60 * 1000;
+        bucket = "minute";
+        buckets = 15;
+      }
+
+      const [tsRes, clientsRes, qnamesRes, recordsRes, rcodeRes, qtypeRes, latencyRes] = await Promise.allSettled([
+        fetchQueryRecorderTimeseries(tag, { bucket, buckets, sinceMs }),
+        fetchQueryRecorderTopClients(tag, { limit: 6, sinceMs }),
+        fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs }),
+        fetchQueryRecords(tag, { limit: 12, sinceMs }),
+        fetchQueryRecorderRcodeDistribution(tag, { sinceMs }),
+        fetchQueryRecorderQtypeDistribution(tag, { sinceMs }),
+        fetchQueryRecorderLatency(tag, { sinceMs }),
       ]);
 
+      if (latencyRes.status === "fulfilled" && latencyRes.value.ok) {
+        setRecorderLatency(latencyRes.value);
+      } else {
+        setRecorderLatency(null);
+      }
+
       if (tsRes.status === "fulfilled" && tsRes.value.ok && tsRes.value.points?.length > 0) {
+        const divisor = bucket === "hour" ? 3600 : 60;
         const mapped = tsRes.value.points.map((b) => ({
           time: new Date(b.bucket_ms).toLocaleTimeString([], {
             hour: "2-digit",
@@ -297,10 +332,11 @@ export function DnsOverview() {
           }),
           timestamp: b.bucket_ms,
           total: b.total,
-          cached: Math.round(b.total * 0.65),
+          success: Math.max(0, b.total - b.error_count),
           blocked: b.error_count,
-          forwarded: Math.max(0, b.total - Math.round(b.total * 0.65) - b.error_count),
-          qps: Number((b.total / 60).toFixed(1)),
+          avgMs: Number(b.avg_ms.toFixed(1)),
+          p95Ms: b.p95_ms,
+          qps: Number((b.total / divisor).toFixed(1)),
         }));
         setTimeseriesData(mapped);
       } else {
@@ -344,7 +380,6 @@ export function DnsOverview() {
             const qname = r.questions_json?.[0]?.name || "unknown";
             const qtype = r.questions_json?.[0]?.qtype || "A";
             const isBlocked = r.rcode === "NXDOMAIN" || r.rcode === "REFUSED" || Boolean(r.error);
-            const isCached = r.elapsed_ms < 1.0;
             const time = new Date(r.created_at_ms).toTimeString().split(" ")[0];
             return {
               id: String(r.id),
@@ -352,9 +387,9 @@ export function DnsOverview() {
               qname,
               qtype,
               clientIp: r.client_ip,
-              status: isBlocked ? "blocked" : isCached ? "cached" : "success",
+              status: isBlocked ? "blocked" : "success",
               latencyMs: Number(r.elapsed_ms.toFixed(1)),
-              upstream: isBlocked || isCached ? undefined : "upstream",
+              upstream: isBlocked ? "blackhole" : "upstream",
             };
           }),
         );
@@ -442,12 +477,16 @@ export function DnsOverview() {
   }, [isAutoRefresh, isConnected, recorderPlugin, loadRecorderData]);
 
   // Derived KPI metrics
-  const totalQueries = useMemo(() => {
+  const windowTotalQueries = useMemo(() => {
+    return timeseriesData.reduce((acc, cur) => acc + cur.total, 0);
+  }, [timeseriesData]);
+
+  const lifetimeTotalQueries = useMemo(() => {
     if (trafficMetrics?.status === "available" && trafficMetrics.requestTotal > 0) {
       return trafficMetrics.requestTotal;
     }
-    return timeseriesData.reduce((acc, cur) => acc + cur.total, 0);
-  }, [trafficMetrics, timeseriesData]);
+    return windowTotalQueries;
+  }, [trafficMetrics, windowTotalQueries]);
 
   const currentQps = useMemo(() => {
     if (trafficMetrics?.qps !== null && trafficMetrics?.qps !== undefined) {
@@ -457,47 +496,72 @@ export function DnsOverview() {
     return lastPoint ? lastPoint.qps : 0;
   }, [trafficMetrics, timeseriesData]);
 
-  const cacheHitCount = useMemo(() => {
-    let hits = 0;
-    for (const series of Object.values(pluginMetrics)) {
-      for (const s of series) {
-        if (s.name === "cache_hit_total" && Number.isFinite(s.value)) {
-          hits += s.value;
-        }
-      }
-    }
-    if (hits > 0) return hits;
-    return timeseriesData.reduce((acc, cur) => acc + cur.cached, 0);
-  }, [pluginMetrics, timeseriesData]);
-
   const blockCount = useMemo(() => {
-    const refused = rcodes.find((r) => r.name.includes("REFUSED"))?.value || 0;
-    if (refused > 0) return refused;
     return timeseriesData.reduce((acc, cur) => acc + cur.blocked, 0);
-  }, [rcodes, timeseriesData]);
-
-  const cacheHitRate = useMemo(() => {
-    if (totalQueries <= 0) return 0;
-    return Number(((cacheHitCount / totalQueries) * 100).toFixed(1));
-  }, [totalQueries, cacheHitCount]);
+  }, [timeseriesData]);
 
   const blockRate = useMemo(() => {
-    if (totalQueries <= 0) return 0;
-    return Number(((blockCount / totalQueries) * 100).toFixed(1));
-  }, [totalQueries, blockCount]);
+    if (windowTotalQueries <= 0) return 0;
+    return Number(((blockCount / windowTotalQueries) * 100).toFixed(1));
+  }, [windowTotalQueries, blockCount]);
 
   const avgLatency = useMemo(() => {
-    const withLatency = configuredUpstreams.filter((u) => u.latencyMs > 0);
-    if (withLatency.length > 0) {
-      const sum = withLatency.reduce((acc, cur) => acc + cur.latencyMs, 0);
-      return Number((sum / withLatency.length).toFixed(1));
+    if (recorderLatency && recorderLatency.sample_size > 0 && recorderLatency.avg_ms > 0) {
+      return Number(recorderLatency.avg_ms.toFixed(1));
+    }
+    const pointsWithLatency = timeseriesData.filter((p) => p.avgMs > 0);
+    if (pointsWithLatency.length > 0) {
+      const sum = pointsWithLatency.reduce((acc, cur) => acc + cur.avgMs * cur.total, 0);
+      const total = pointsWithLatency.reduce((acc, cur) => acc + cur.total, 0);
+      if (total > 0) return Number((sum / total).toFixed(1));
     }
     if (liveLogs.length > 0) {
       const sum = liveLogs.reduce((acc, cur) => acc + cur.latencyMs, 0);
       return Number((sum / liveLogs.length).toFixed(1));
     }
     return 0;
-  }, [configuredUpstreams, liveLogs]);
+  }, [recorderLatency, timeseriesData, liveLogs]);
+
+  const cacheStats = useMemo(() => {
+    let hits = 0;
+    let misses = 0;
+    let lookups = 0;
+    let hasCachePlugin = false;
+
+    for (const plugin of plugins) {
+      if (plugin.type === "executor" && (plugin.pluginKind === "cache" || plugin.pluginKind.includes("cache"))) {
+        hasCachePlugin = true;
+      }
+    }
+
+    for (const series of Object.values(pluginMetrics)) {
+      for (const s of series) {
+        if (s.name === "cache_hit_total" && Number.isFinite(s.value)) {
+          hits += s.value;
+          hasCachePlugin = true;
+        }
+        if (s.name === "cache_miss_total" && Number.isFinite(s.value)) {
+          misses += s.value;
+          hasCachePlugin = true;
+        }
+        if (s.name === "cache_lookup_total" && Number.isFinite(s.value)) {
+          lookups += s.value;
+          hasCachePlugin = true;
+        }
+      }
+    }
+
+    const total = lookups > 0 ? lookups : hits + misses;
+    const hitRate = total > 0 ? Number(((hits / total) * 100).toFixed(1)) : 0;
+
+    return {
+      hasCachePlugin,
+      hits,
+      misses,
+      total,
+      hitRate,
+    };
+  }, [plugins, pluginMetrics]);
 
   const fastestUpstream = useMemo(() => {
     const valid = configuredUpstreams.filter((u) => u.latencyMs > 0);
@@ -652,11 +716,15 @@ export function DnsOverview() {
             </div>
           </div>
           <div suppressHydrationWarning className="text-xl sm:text-2xl font-bold tracking-tight tabular-nums text-foreground">
-            {formatNumber(totalQueries)}
+            {formatNumber(windowTotalQueries > 0 ? windowTotalQueries : lifetimeTotalQueries)}
           </div>
           <div className="flex items-center gap-1 text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
             <TrendingUp className="h-3 w-3 text-primary shrink-0" />
-            <span className="truncate">累计解析总量</span>
+            <span className="truncate">
+              {windowTotalQueries > 0
+                ? `时段累计 (总计: ${formatNumber(lifetimeTotalQueries)})`
+                : "累计解析总量"}
+            </span>
           </div>
         </div>
 
@@ -693,14 +761,14 @@ export function DnsOverview() {
           </div>
           <div className="flex items-center justify-between text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
             <span suppressHydrationWarning className="truncate">{formatNumber(blockCount)} 次拦截</span>
-            <span className="text-[10px] font-mono text-muted-foreground shrink-0 hidden sm:inline">REFUSED</span>
+            <span className="text-[10px] font-mono text-muted-foreground shrink-0 hidden sm:inline">REFUSED / 阻断</span>
           </div>
         </div>
 
         {/* Card 4: Average Latency */}
         <div className="liquid-glass-card p-3 sm:p-4 relative overflow-hidden group">
           <div className="flex items-center justify-between mb-1.5 sm:mb-2">
-            <span className="text-xs font-medium text-muted-foreground truncate">平均响应耗时</span>
+            <span className="text-xs font-medium text-muted-foreground truncate">平均解析耗时</span>
             <div className="h-6 w-6 sm:h-7 sm:w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center shrink-0">
               <Clock className="h-3 w-3 sm:h-3.5 sm:w-3.5" />
             </div>
@@ -726,11 +794,15 @@ export function DnsOverview() {
             </div>
           </div>
           <div suppressHydrationWarning className="text-xl sm:text-2xl font-bold tracking-tight tabular-nums text-foreground">
-            {cacheHitRate}%
+            {cacheStats.hasCachePlugin ? `${cacheStats.hitRate}%` : "-"}
           </div>
           <div className="flex items-center justify-between text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
-            <span suppressHydrationWarning className="truncate">{formatNumber(cacheHitCount)} 命中</span>
-            <span className="font-mono text-[10px] shrink-0">本地缓存</span>
+            <span suppressHydrationWarning className="truncate">
+              {cacheStats.hasCachePlugin ? `${formatNumber(cacheStats.hits)} 命中` : "未配置缓存插件"}
+            </span>
+            <span className="font-mono text-[10px] shrink-0">
+              {cacheStats.hasCachePlugin ? "本地缓存" : "未启用"}
+            </span>
           </div>
         </div>
 
@@ -762,10 +834,10 @@ export function DnsOverview() {
           <div>
             <div className="flex items-center gap-2">
               <BarChart3 className="h-4 w-4 text-primary" />
-              <h2 className="text-base font-semibold text-foreground">DNS 流量与吞吐趋势</h2>
+              <h2 className="text-base font-semibold text-foreground">DNS 流量与解析趋势</h2>
             </div>
             <p className="text-xs text-muted-foreground mt-0.5">
-              总解析查询量、本地缓存命中、规则拦截阻断与外部转发上游的实时动态对比
+              实时展示总解析查询量、正常解析响应与安全规则阻断的动态走势
             </p>
           </div>
 
@@ -777,15 +849,11 @@ export function DnsOverview() {
             </span>
             <span className="flex items-center gap-1.5">
               <span className="h-2 w-2 rounded-full bg-[#10b981]" />
-              <span>缓存命中</span>
+              <span>正常响应</span>
             </span>
             <span className="flex items-center gap-1.5">
               <span className="h-2 w-2 rounded-full bg-[#f43f5e]" />
-              <span>安全拦截</span>
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="h-2 w-2 rounded-full bg-[#64748b]" />
-              <span>转发上游</span>
+              <span>规则阻断</span>
             </span>
           </div>
         </div>
@@ -796,15 +864,15 @@ export function DnsOverview() {
               <AreaChart data={timeseriesData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                 <defs>
                   <linearGradient id="gradientTotal" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#0284c7" stopOpacity={0.12} />
+                    <stop offset="5%" stopColor="#0284c7" stopOpacity={0.16} />
                     <stop offset="95%" stopColor="#0284c7" stopOpacity={0.0} />
                   </linearGradient>
-                  <linearGradient id="gradientCached" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#10b981" stopOpacity={0.06} />
+                  <linearGradient id="gradientSuccess" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#10b981" stopOpacity={0.12} />
                     <stop offset="95%" stopColor="#10b981" stopOpacity={0.0} />
                   </linearGradient>
                   <linearGradient id="gradientBlocked" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#f43f5e" stopOpacity={0.05} />
+                    <stop offset="5%" stopColor="#f43f5e" stopOpacity={0.15} />
                     <stop offset="95%" stopColor="#f43f5e" stopOpacity={0.0} />
                   </linearGradient>
                 </defs>
@@ -831,12 +899,13 @@ export function DnsOverview() {
                 <Tooltip
                   content={({ active, payload, label }) => {
                     if (!active || !payload?.length) return null;
+                    const item = payload[0]?.payload as TrafficPoint;
                     return (
                       <div className="liquid-glass-card p-3 shadow-xl text-xs space-y-1.5 min-w-[170px] border border-border/60">
                         <div className="font-semibold text-foreground border-b border-border/30 pb-1 flex items-center justify-between">
                           <span>时间: {label}</span>
                           <span className="text-[10px] text-muted-foreground font-mono">
-                            QPS: {payload[0]?.payload?.qps}
+                            QPS: {item?.qps ?? 0}
                           </span>
                         </div>
                         <div className="flex items-center justify-between">
@@ -844,29 +913,30 @@ export function DnsOverview() {
                             <span className="h-1.5 w-1.5 rounded-full bg-[#0284c7]" />
                             总请求:
                           </span>
-                          <span className="font-bold tabular-nums text-foreground">{payload[0]?.value}</span>
+                          <span className="font-bold tabular-nums text-foreground">{item?.total ?? 0}</span>
                         </div>
                         <div className="flex items-center justify-between">
                           <span className="flex items-center gap-1.5 text-muted-foreground">
                             <span className="h-1.5 w-1.5 rounded-full bg-[#10b981]" />
-                            缓存命中:
+                            正常响应:
                           </span>
-                          <span className="font-bold tabular-nums text-foreground">{payload[1]?.value}</span>
+                          <span className="font-bold tabular-nums text-foreground">{item?.success ?? 0}</span>
                         </div>
                         <div className="flex items-center justify-between">
                           <span className="flex items-center gap-1.5 text-muted-foreground">
                             <span className="h-1.5 w-1.5 rounded-full bg-[#f43f5e]" />
-                            规则拦截:
+                            规则阻断:
                           </span>
-                          <span className="font-bold tabular-nums text-foreground">{payload[2]?.value}</span>
+                          <span className="font-bold tabular-nums text-foreground">{item?.blocked ?? 0}</span>
                         </div>
-                        <div className="flex items-center justify-between">
-                          <span className="flex items-center gap-1.5 text-muted-foreground">
-                            <span className="h-1.5 w-1.5 rounded-full bg-[#64748b]" />
-                            上游转发:
-                          </span>
-                          <span className="font-bold tabular-nums text-foreground">{payload[3]?.value}</span>
-                        </div>
+                        {item?.avgMs !== undefined && item?.avgMs > 0 && (
+                          <div className="flex items-center justify-between pt-1 border-t border-border/20 text-[11px]">
+                            <span className="text-muted-foreground">平均耗时:</span>
+                            <span className="font-mono text-emerald-600 dark:text-emerald-400 font-medium">
+                              {item.avgMs} ms
+                            </span>
+                          </div>
+                        )}
                       </div>
                     );
                   }}
@@ -881,11 +951,11 @@ export function DnsOverview() {
                 />
                 <Area
                   type="monotone"
-                  dataKey="cached"
+                  dataKey="success"
                   stroke="#10b981"
                   strokeWidth={1.5}
                   fillOpacity={1}
-                  fill="url(#gradientCached)"
+                  fill="url(#gradientSuccess)"
                 />
                 <Area
                   type="monotone"
@@ -894,15 +964,6 @@ export function DnsOverview() {
                   strokeWidth={1.5}
                   fillOpacity={1}
                   fill="url(#gradientBlocked)"
-                />
-                <Area
-                  type="monotone"
-                  dataKey="forwarded"
-                  stroke="#64748b"
-                  strokeWidth={1.2}
-                  strokeDasharray="3 3"
-                  fillOpacity={0}
-                  fill="transparent"
                 />
               </AreaChart>
             </ResponsiveContainer>
