@@ -1180,7 +1180,7 @@ export function DnsOverview() {
             {activeDistTab === "protocol" ? (
               <div className="space-y-3 pt-1">
                 {configuredProtocols.length > 0 ? (
-                  configuredProtocols.map((p) => (
+                  configuredProtocols.map((p, idx) => (
                     <div key={p.name} className="space-y-1">
                       <div className="flex items-center justify-between text-xs">
                         <span className="font-medium flex items-center gap-1.5 text-foreground">
@@ -1191,12 +1191,20 @@ export function DnsOverview() {
                           {formatNumber(p.value)} ({p.pct}%)
                         </span>
                       </div>
-                      <div className="h-2 w-full rounded-full bg-foreground/[0.05] overflow-hidden">
+                      <div className="liquid-glass-progress-track h-2">
                         <div
-                          className="h-full rounded-full transition-all duration-500"
+                          className={cn(
+                            "liquid-glass-progress-bar",
+                            idx === 0
+                              ? "neon-glow-cyan"
+                              : idx === 1
+                              ? "neon-glow-violet"
+                              : idx === 2
+                              ? "neon-glow-emerald"
+                              : "neon-glow-amber",
+                          )}
                           style={{
-                            width: `${p.pct}%`,
-                            backgroundColor: p.color,
+                            width: `${Math.min(100, Math.max(0, p.pct))}%`,
                           }}
                         />
                       </div>
@@ -1212,7 +1220,7 @@ export function DnsOverview() {
             ) : (
               <div className="space-y-3 pt-1">
                 {qtypes.length > 0 ? (
-                  qtypes.map((q) => (
+                  qtypes.map((q, idx) => (
                     <div key={q.name} className="space-y-1">
                       <div className="flex items-center justify-between text-xs">
                         <span className="font-medium flex items-center gap-1.5 text-foreground">
@@ -1223,12 +1231,22 @@ export function DnsOverview() {
                           {formatNumber(q.value)} ({q.pct}%)
                         </span>
                       </div>
-                      <div className="h-2 w-full rounded-full bg-foreground/[0.05] overflow-hidden">
+                      <div className="liquid-glass-progress-track h-2">
                         <div
-                          className="h-full rounded-full transition-all duration-500"
+                          className={cn(
+                            "liquid-glass-progress-bar",
+                            idx === 0
+                              ? "neon-glow-cyan"
+                              : idx === 1
+                              ? "neon-glow-emerald"
+                              : idx === 2
+                              ? "neon-glow-violet"
+                              : idx === 3
+                              ? "neon-glow-amber"
+                              : "neon-glow-rose",
+                          )}
                           style={{
-                            width: `${q.pct}%`,
-                            backgroundColor: q.color,
+                            width: `${Math.min(100, Math.max(0, q.pct))}%`,
                           }}
                         />
                       </div>
@@ -1269,11 +1287,23 @@ export function DnsOverview() {
         {configuredUpstreams.length > 0 ? (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3.5">
             {configuredUpstreams.map((ups) => {
-              const maxQ = Math.max(1, ...configuredUpstreams.map((u) => u.queries));
+              const successPct =
+                ups.queries > 0 ? Math.min(100, Math.max(0, ups.successRate)) : 0;
+              const neonClass =
+                ups.queries === 0
+                  ? "neon-glow-cyan opacity-25"
+                  : ups.successRate >= 80
+                  ? "neon-glow-emerald"
+                  : ups.successRate >= 40
+                  ? "neon-glow-cyan"
+                  : ups.successRate >= 20
+                  ? "neon-glow-amber"
+                  : "neon-glow-rose";
+
               return (
                 <div
                   key={`${ups.tag}-${ups.addr}`}
-                  className="p-3.5 rounded-xl border border-border/40 bg-foreground/[0.02] hover:bg-foreground/[0.04] transition-all space-y-2.5"
+                  className="p-3.5 rounded-xl border border-white/20 dark:border-white/10 bg-white/25 dark:bg-white/[0.03] backdrop-blur-md shadow-sm hover:shadow-md transition-all space-y-2.5"
                 >
                   <div className="flex items-start justify-between">
                     <div className="min-w-0 pr-2">
@@ -1296,16 +1326,39 @@ export function DnsOverview() {
                     </span>
                   </div>
 
-                  <div className="space-y-1">
+                  <div className="space-y-1.5">
                     <div className="flex items-center justify-between text-[11px] text-muted-foreground">
-                      <span>处理量: {formatNumber(ups.queries)}</span>
-                      <span>成功率: {ups.queries > 0 ? `${ups.successRate}%` : "-"}</span>
+                      <span>
+                        处理量:{" "}
+                        <span className="font-mono tabular-nums text-foreground">
+                          {formatNumber(ups.queries)}
+                        </span>
+                      </span>
+                      <span>
+                        成功率:{" "}
+                        <span
+                          className={cn(
+                            "font-mono tabular-nums font-medium",
+                            ups.queries === 0
+                              ? "text-muted-foreground"
+                              : ups.successRate >= 80
+                              ? "text-emerald-500 dark:text-emerald-400"
+                              : ups.successRate >= 40
+                              ? "text-cyan-500 dark:text-cyan-400"
+                              : ups.successRate >= 20
+                              ? "text-amber-500 dark:text-amber-400"
+                              : "text-rose-500 dark:text-rose-400",
+                          )}
+                        >
+                          {ups.queries > 0 ? `${ups.successRate}%` : "-"}
+                        </span>
+                      </span>
                     </div>
-                    <div className="h-1.5 w-full rounded-full bg-foreground/[0.06] overflow-hidden">
+                    <div className="liquid-glass-progress-track h-2">
                       <div
-                        className="h-full rounded-full bg-primary"
+                        className={cn("liquid-glass-progress-bar", neonClass)}
                         style={{
-                          width: `${Math.min(100, (ups.queries / maxQ) * 100)}%`,
+                          width: `${successPct}%`,
                         }}
                       />
                     </div>
@@ -1454,7 +1507,7 @@ export function DnsOverview() {
 
           <div className="space-y-3">
             {topClients.length > 0 ? (
-              topClients.map((item) => (
+              topClients.map((item, idx) => (
                 <div key={item.ip || item.name} className="space-y-1">
                   <div className="flex items-center justify-between text-xs">
                     <div className="flex items-center gap-1.5 min-w-0">
@@ -1464,10 +1517,19 @@ export function DnsOverview() {
                       {item.percentage}%
                     </span>
                   </div>
-                  <div className="h-1.5 w-full rounded-full bg-foreground/[0.05] overflow-hidden">
+                  <div className="liquid-glass-progress-track h-2">
                     <div
-                      className="h-full rounded-full bg-primary"
-                      style={{ width: `${item.percentage}%` }}
+                      className={cn(
+                        "liquid-glass-progress-bar",
+                        idx === 0
+                          ? "neon-glow-cyan"
+                          : idx === 1
+                          ? "neon-glow-emerald"
+                          : idx === 2
+                          ? "neon-glow-violet"
+                          : "neon-glow-amber",
+                      )}
+                      style={{ width: `${Math.min(100, Math.max(0, item.percentage))}%` }}
                     />
                   </div>
                 </div>
