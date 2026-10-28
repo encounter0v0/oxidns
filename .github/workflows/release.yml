@@ -4,9 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release Tag Version (e.g. v1.6.1)'
+        description: 'Release Tag Version (e.g. v1.6.8)'
         required: false
-        default: 'v1.6.1'
+        default: 'v1.6.8'
+        type: string
+      release_title:
+        description: 'Release Title / Overview (optional)'
+        required: false
+        default: ''
+        type: string
+      release_notes:
+        description: 'Custom Release Notes (optional Markdown content)'
+        required: false
+        default: ''
         type: string
   push:
     tags:
@@ -33,7 +43,7 @@ jobs:
           set -euo pipefail
           VERSION="${{ github.ref_name }}"
           if [[ "$VERSION" == "main" || "$VERSION" == "master" ]]; then
-            VERSION="${{ inputs.tag_name || 'v1.6.2' }}"
+            VERSION="${{ inputs.tag_name || 'v1.6.8' }}"
           fi
           PLAIN_VERSION="${VERSION#v}"
           echo "Syncing Cargo version to: $PLAIN_VERSION"
@@ -200,7 +210,7 @@ jobs:
           set -euo pipefail
           VERSION="${{ github.ref_name }}"
           if [[ "$VERSION" == "main" || "$VERSION" == "master" ]]; then
-            VERSION="${{ inputs.tag_name || 'v1.6.2' }}"
+            VERSION="${{ inputs.tag_name || 'v1.6.8' }}"
           fi
           PLAIN_VERSION="${VERSION#v}"
           echo "Syncing Cargo version to: $PLAIN_VERSION"
@@ -374,7 +384,7 @@ jobs:
           set -euo pipefail
           VERSION="${{ github.ref_name }}"
           if [[ "$VERSION" == "main" || "$VERSION" == "master" ]]; then
-            VERSION="${{ inputs.tag_name || 'v1.6.2' }}"
+            VERSION="${{ inputs.tag_name || 'v1.6.8' }}"
           fi
           PLAIN_VERSION="${VERSION#v}"
           echo "Syncing Cargo version to: $PLAIN_VERSION"
@@ -466,6 +476,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Sync Cargo version with release tag
         shell: bash
@@ -473,7 +485,7 @@ jobs:
           set -euo pipefail
           VERSION="${{ github.ref_name }}"
           if [[ "$VERSION" == "main" || "$VERSION" == "master" ]]; then
-            VERSION="${{ inputs.tag_name || 'v1.6.2' }}"
+            VERSION="${{ inputs.tag_name || 'v1.6.8' }}"
           fi
           PLAIN_VERSION="${VERSION#v}"
           echo "Syncing Cargo version to: $PLAIN_VERSION"
@@ -502,23 +514,20 @@ jobs:
         id: notes
         env:
           INPUT_TAG: ${{ inputs.tag_name }}
+          INPUT_TITLE: ${{ inputs.release_title }}
+          INPUT_NOTES: ${{ inputs.release_notes }}
         run: |
           set -euo pipefail
           VERSION="${{ github.ref_name }}"
           if [[ "$VERSION" == "main" || "$VERSION" == "master" ]]; then
-            VERSION="${INPUT_TAG:-v1.6.1}"
+            VERSION="${INPUT_TAG:-v1.6.8}"
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          RELEASE_NOTES_PATH=".github/release-notes.md"
-          if [[ ! -s "$RELEASE_NOTES_PATH" ]] || ! grep -q "^# OxiDNS ${VERSION}" "$RELEASE_NOTES_PATH"; then
-            echo "# OxiDNS ${VERSION}" > "$RELEASE_NOTES_PATH"
-            echo "" >> "$RELEASE_NOTES_PATH"
-            echo "## ✨ OxiDNS Modern Liquid Glass WebUI Release" >> "$RELEASE_NOTES_PATH"
-            echo "" >> "$RELEASE_NOTES_PATH"
-            echo "- DNS 监控总览大屏与实时解析吞吐监控" >> "$RELEASE_NOTES_PATH"
-            echo "- 现代简约液态玻璃 (Liquid Glass) 设计风格" >> "$RELEASE_NOTES_PATH"
-            echo "- 支持跟随系统切换明暗黑模式" >> "$RELEASE_NOTES_PATH"
-          fi
+          python3 .github/scripts/generate_release_notes.py \
+            --version "${VERSION}" \
+            --output ".github/release-notes.md" \
+            --title "${INPUT_TITLE:-}" \
+            --custom-notes "${INPUT_NOTES:-}"
           python3 -m unittest discover -s .github/scripts -p '*_test.py' || true
 
       - name: Create release
