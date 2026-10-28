@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import {
   BarChart3,
   Calendar,
@@ -48,6 +48,7 @@ import {
   fetchQueryRecords,
   type QueryRecordRow,
   type QueryRecorderLatencySummary,
+  type QueryRecorderTimeseriesPoint,
 } from "@/lib/oxidns-api";
 import { GlassProgress } from "@/components/ui/glass-progress";
 
@@ -117,6 +118,108 @@ interface LiveQueryLog {
 }
 
 
+// --- SWR Cache & Normalized Timeseries Helper for Instant Silky-Smooth Chart Rendering ---
+interface RangeCacheData {
+  timeseriesData: TrafficPoint[];
+  topClients: TopItem[];
+  topQueries: TopItem[];
+  topBlocked: TopItem[];
+  liveLogs: LiveQueryLog[];
+  rcodes: RcodeDist[];
+  qtypes: QtypeDist[];
+  recorderLatency: QueryRecorderLatencySummary | null;
+  fetchedAt: number;
+}
+
+function normalizeTimeseriesData(
+  rawPoints: QueryRecorderTimeseriesPoint[],
+  range: TimeRange,
+  targetNow = Date.now(),
+): TrafficPoint[] {
+  let stepMs: number;
+  let totalSlots: number;
+  let formatLabel: (date: Date) => string;
+
+  if (range === "24h") {
+    stepMs = 60 * 60 * 1000; // 1 hour per bucket
+    totalSlots = 24;
+    formatLabel = (d) => `${String(d.getHours()).padStart(2, "0")}:00`;
+  } else if (range === "live") {
+    stepMs = 60 * 1000; // 1 minute per bucket
+    totalSlots = 15;
+    formatLabel = (d) =>
+      d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  } else {
+    // 1h: 60 minutes
+    stepMs = 60 * 1000;
+    totalSlots = 60;
+    formatLabel = (d) =>
+      d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  const divisor = range === "24h" ? 3600 : 60;
+  const currentSlot = Math.floor(targetNow / stepMs) * stepMs;
+  const startSlot = currentSlot - (totalSlots - 1) * stepMs;
+
+  const pointsMap = new Map<number, { total: number; error_count: number; avg_ms: number; p95_ms: number }>();
+
+  for (const pt of rawPoints) {
+    const slotIndex = Math.round((pt.bucket_ms - startSlot) / stepMs);
+    if (slotIndex >= 0 && slotIndex < totalSlots) {
+      const slotTime = startSlot + slotIndex * stepMs;
+      const prev = pointsMap.get(slotTime);
+      if (prev) {
+        pointsMap.set(slotTime, {
+          total: prev.total + pt.total,
+          error_count: prev.error_count + pt.error_count,
+          avg_ms: pt.avg_ms > 0 ? (prev.avg_ms > 0 ? (prev.avg_ms + pt.avg_ms) / 2 : pt.avg_ms) : prev.avg_ms,
+          p95_ms: Math.max(prev.p95_ms, pt.p95_ms),
+        });
+      } else {
+        pointsMap.set(slotTime, {
+          total: pt.total,
+          error_count: pt.error_count,
+          avg_ms: pt.avg_ms,
+          p95_ms: pt.p95_ms,
+        });
+      }
+    }
+  }
+
+  const result: TrafficPoint[] = [];
+  for (let i = 0; i < totalSlots; i++) {
+    const slotTime = startSlot + i * stepMs;
+    const pt = pointsMap.get(slotTime);
+    const d = new Date(slotTime);
+
+    if (pt) {
+      result.push({
+        time: formatLabel(d),
+        timestamp: slotTime,
+        total: pt.total,
+        success: Math.max(0, pt.total - pt.error_count),
+        blocked: pt.error_count,
+        avgMs: Number(pt.avg_ms.toFixed(1)),
+        p95Ms: pt.p95_ms,
+        qps: Number((pt.total / divisor).toFixed(1)),
+      });
+    } else {
+      result.push({
+        time: formatLabel(d),
+        timestamp: slotTime,
+        total: 0,
+        success: 0,
+        blocked: 0,
+        avgMs: 0,
+        p95Ms: 0,
+        qps: 0,
+      });
+    }
+  }
+
+  return result;
+}
+
 export function DnsOverview() {
   const { formatNumber } = useI18n();
   const trafficMetrics = useAppStore((s) => s.trafficMetrics);
@@ -127,6 +230,8 @@ export function DnsOverview() {
 
   // States
   const [timeRange, setTimeRange] = useState<TimeRange>("1h");
+  const timeRangeRef = useRef<TimeRange>(timeRange);
+  const dataCacheRef = useRef<Partial<Record<TimeRange, RangeCacheData>>>({});
   const [isAutoRefresh, setIsAutoRefresh] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [activeDistTab, setActiveDistTab] = useState<"protocol" | "qtype">("protocol");
@@ -268,208 +373,283 @@ export function DnsOverview() {
   }, [plugins, pluginMetrics]);
 
   // Load real telemetry from query_recorder if backend is active
-  const loadRecorderData = useCallback(async () => {
-    if (!isConnected || !recorderPlugin) {
-      setTimeseriesData([]);
-      setTopClients([]);
-      setTopQueries([]);
-      setTopBlocked([]);
-      setLiveLogs([]);
-      setRcodes([]);
-      setQtypes([]);
-      setRecorderLatency(null);
-      return;
-    }
-    try {
-      setIsRefreshing(true);
-      const tag = recorderPlugin.name || recorderPlugin.id;
-
-      const now = Date.now();
-      let sinceMs: number | undefined;
-      let bucket: "minute" | "hour" = "minute";
-      let buckets = 60;
-
-      if (timeRange === "1h") {
-        sinceMs = now - 60 * 60 * 1000;
-        bucket = "minute";
-        buckets = 60;
-      } else if (timeRange === "24h") {
-        sinceMs = now - 24 * 60 * 60 * 1000;
-        bucket = "hour";
-        buckets = 24;
-      } else {
-        // live (15 min)
-        sinceMs = now - 15 * 60 * 1000;
-        bucket = "minute";
-        buckets = 15;
+  const loadRecorderData = useCallback(
+    async (targetRange: TimeRange = timeRangeRef.current, isSilent = false) => {
+      if (!isConnected || !recorderPlugin) {
+        if (!isSilent) {
+          setTimeseriesData([]);
+          setTopClients([]);
+          setTopQueries([]);
+          setTopBlocked([]);
+          setLiveLogs([]);
+          setRcodes([]);
+          setQtypes([]);
+          setRecorderLatency(null);
+        }
+        return;
       }
+      try {
+        if (!isSilent) {
+          setIsRefreshing(true);
+        }
+        const tag = recorderPlugin.name || recorderPlugin.id;
 
-      const [tsRes, clientsRes, qnamesRes, blockedQnamesRes, recordsRes, rcodeRes, qtypeRes, latencyRes] = await Promise.allSettled([
-        fetchQueryRecorderTimeseries(tag, { bucket, buckets, sinceMs }),
-        fetchQueryRecorderTopClients(tag, { limit: 6, sinceMs }),
-        fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs }),
-        fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs, status: "error" }),
-        fetchQueryRecords(tag, { limit: 12, sinceMs }),
-        fetchQueryRecorderRcodeDistribution(tag, { sinceMs }),
-        fetchQueryRecorderQtypeDistribution(tag, { sinceMs }),
-        fetchQueryRecorderLatency(tag, { sinceMs }),
-      ]);
+        const now = Date.now();
+        let sinceMs: number | undefined;
+        let bucket: "minute" | "hour" = "minute";
+        let buckets = 60;
 
-      if (latencyRes.status === "fulfilled" && latencyRes.value.ok) {
-        setRecorderLatency(latencyRes.value);
-      } else {
-        setRecorderLatency(null);
-      }
+        if (targetRange === "1h") {
+          sinceMs = now - 60 * 60 * 1000;
+          bucket = "minute";
+          buckets = 60;
+        } else if (targetRange === "24h") {
+          sinceMs = now - 24 * 60 * 60 * 1000;
+          bucket = "hour";
+          buckets = 24;
+        } else {
+          // live (15 min)
+          sinceMs = now - 15 * 60 * 1000;
+          bucket = "minute";
+          buckets = 15;
+        }
 
-      if (tsRes.status === "fulfilled" && tsRes.value.ok && tsRes.value.points?.length > 0) {
-        const divisor = bucket === "hour" ? 3600 : 60;
-        const mapped = tsRes.value.points.map((b) => {
-          const d = new Date(b.bucket_ms);
-          const timeLabel =
-            timeRange === "24h"
-              ? `${String(d.getHours()).padStart(2, "0")}:00`
-              : d.toLocaleTimeString([], {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                });
-          return {
-            time: timeLabel,
-            timestamp: b.bucket_ms,
-            total: b.total,
-            success: Math.max(0, b.total - b.error_count),
-            blocked: b.error_count,
-            avgMs: Number(b.avg_ms.toFixed(1)),
-            p95Ms: b.p95_ms,
-            qps: Number((b.total / divisor).toFixed(1)),
-          };
-        });
-        setTimeseriesData(mapped);
-      } else {
-        setTimeseriesData([]);
-      }
+        const [tsRes, clientsRes, qnamesRes, blockedQnamesRes, recordsRes, rcodeRes, qtypeRes, latencyRes] =
+          await Promise.allSettled([
+            fetchQueryRecorderTimeseries(tag, { bucket, buckets, sinceMs }),
+            fetchQueryRecorderTopClients(tag, { limit: 6, sinceMs }),
+            fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs }),
+            fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs, status: "error" }),
+            fetchQueryRecords(tag, { limit: 12, sinceMs }),
+            fetchQueryRecorderRcodeDistribution(tag, { sinceMs }),
+            fetchQueryRecorderQtypeDistribution(tag, { sinceMs }),
+            fetchQueryRecorderLatency(tag, { sinceMs }),
+          ]);
 
-      if (clientsRes.status === "fulfilled" && clientsRes.value.ok && clientsRes.value.rows?.length > 0) {
-        const totalSample = clientsRes.value.sample_size || clientsRes.value.rows.reduce((acc, r) => acc + r.count, 0) || 1;
-        setTopClients(
-          clientsRes.value.rows.map((row, idx) => ({
+        let newRecorderLatency: QueryRecorderLatencySummary | null = null;
+        if (latencyRes.status === "fulfilled" && latencyRes.value.ok) {
+          newRecorderLatency = latencyRes.value;
+        }
+
+        let newTimeseriesData: TrafficPoint[] = [];
+        if (tsRes.status === "fulfilled" && tsRes.value.ok) {
+          const rawPoints = tsRes.value.points || [];
+          newTimeseriesData = normalizeTimeseriesData(rawPoints, targetRange, now);
+        } else {
+          newTimeseriesData = normalizeTimeseriesData([], targetRange, now);
+        }
+
+        let newTopClients: TopItem[] = [];
+        if (clientsRes.status === "fulfilled" && clientsRes.value.ok && clientsRes.value.rows?.length > 0) {
+          const totalSample =
+            clientsRes.value.sample_size || clientsRes.value.rows.reduce((acc, r) => acc + r.count, 0) || 1;
+          newTopClients = clientsRes.value.rows.map((row, idx) => ({
             rank: idx + 1,
             name: row.key,
             ip: row.key,
             count: row.count,
             percentage: Number(((row.share ? row.share * 100 : (row.count / totalSample) * 100)).toFixed(1)),
-          })),
-        );
-      } else {
-        setTopClients([]);
-      }
+          }));
+        }
 
-      if (qnamesRes.status === "fulfilled" && qnamesRes.value.ok && qnamesRes.value.rows?.length > 0) {
-        const totalSample = qnamesRes.value.sample_size || qnamesRes.value.rows.reduce((acc, r) => acc + r.count, 0) || 1;
-        setTopQueries(
-          qnamesRes.value.rows.map((row, idx) => ({
+        let newTopQueries: TopItem[] = [];
+        if (qnamesRes.status === "fulfilled" && qnamesRes.value.ok && qnamesRes.value.rows?.length > 0) {
+          const totalSample =
+            qnamesRes.value.sample_size || qnamesRes.value.rows.reduce((acc, r) => acc + r.count, 0) || 1;
+          newTopQueries = qnamesRes.value.rows.map((row, idx) => ({
             rank: idx + 1,
             name: row.key,
             count: row.count,
             percentage: Number(((row.share ? row.share * 100 : (row.count / totalSample) * 100)).toFixed(1)),
             category: "域名解析",
-          })),
-        );
-      } else {
-        setTopQueries([]);
-      }
+          }));
+        }
 
-      if (blockedQnamesRes.status === "fulfilled" && blockedQnamesRes.value.ok && blockedQnamesRes.value.rows?.length > 0) {
-        const totalSample = blockedQnamesRes.value.sample_size || blockedQnamesRes.value.rows.reduce((acc, r) => acc + r.count, 0) || 1;
-        setTopBlocked(
-          blockedQnamesRes.value.rows.map((row, idx) => ({
+        let newTopBlocked: TopItem[] = [];
+        if (
+          blockedQnamesRes.status === "fulfilled" &&
+          blockedQnamesRes.value.ok &&
+          blockedQnamesRes.value.rows?.length > 0
+        ) {
+          const totalSample =
+            blockedQnamesRes.value.sample_size ||
+            blockedQnamesRes.value.rows.reduce((acc, r) => acc + r.count, 0) ||
+            1;
+          newTopBlocked = blockedQnamesRes.value.rows.map((row, idx) => ({
             rank: idx + 1,
             name: row.key,
             count: row.count,
             percentage: Number(((row.share ? row.share * 100 : (row.count / totalSample) * 100)).toFixed(1)),
             ruleTag: "规则阻断",
-          })),
-        );
-      } else if (recordsRes.status === "fulfilled" && recordsRes.value.ok && recordsRes.value.records?.length > 0) {
-        const records = recordsRes.value.records;
-        const blockedRows = records.filter(
-          (r: QueryRecordRow) => r.rcode === "NXDOMAIN" || r.rcode === "REFUSED" || Boolean(r.error),
-        );
-        if (blockedRows.length > 0) {
-          const map: Record<string, number> = {};
-          for (const b of blockedRows) {
-            const name = b.questions_json?.[0]?.name || "unknown";
-            map[name] = (map[name] || 0) + 1;
-          }
-          const sorted = Object.entries(map).sort((a, b) => b[1] - a[1]);
-          setTopBlocked(
-            sorted.slice(0, 7).map(([name, count], idx) => ({
+          }));
+        } else if (recordsRes.status === "fulfilled" && recordsRes.value.ok && recordsRes.value.records?.length > 0) {
+          const records = recordsRes.value.records;
+          const blockedRows = records.filter(
+            (r: QueryRecordRow) => r.rcode === "NXDOMAIN" || r.rcode === "REFUSED" || Boolean(r.error),
+          );
+          if (blockedRows.length > 0) {
+            const map: Record<string, number> = {};
+            for (const b of blockedRows) {
+              const name = b.questions_json?.[0]?.name || "unknown";
+              map[name] = (map[name] || 0) + 1;
+            }
+            const sorted = Object.entries(map).sort((a, b) => b[1] - a[1]);
+            newTopBlocked = sorted.slice(0, 7).map(([name, count], idx) => ({
               rank: idx + 1,
               name,
               count,
               percentage: Number(((count / blockedRows.length) * 100).toFixed(1)),
               ruleTag: "规则阻断",
-            })),
-          );
-        } else {
-          setTopBlocked([]);
+            }));
+          }
         }
-      } else {
-        setTopBlocked([]);
-      }
 
-      if (rcodeRes.status === "fulfilled" && rcodeRes.value.ok && rcodeRes.value.rows?.length > 0) {
-        const rcodeColors: Record<string, string> = {
-          NOERROR: "#10b981",
-          NXDOMAIN: "#64748b",
-          REFUSED: "#f43f5e",
-          SERVFAIL: "#f59e0b",
-        };
-        setRcodes(
-          rcodeRes.value.rows.map((row) => ({
+        let newLiveLogs: LiveQueryLog[] = [];
+        if (recordsRes.status === "fulfilled" && recordsRes.value.ok && recordsRes.value.records?.length > 0) {
+          newLiveLogs = recordsRes.value.records.map((r: QueryRecordRow) => {
+            const d = new Date(r.created_at_ms);
+            const domain = r.questions_json?.[0]?.name || "unknown";
+            const qtype = r.questions_json?.[0]?.qtype || "A";
+            let status: "success" | "cached" | "blocked" | "error" = "success";
+            if (r.rcode === "NXDOMAIN" || r.rcode === "REFUSED") {
+              status = "blocked";
+            } else if (r.error) {
+              status = "error";
+            }
+            return {
+              id: String(r.id || `${r.created_at_ms}-${r.request_id}`),
+              time: d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+              qname: domain,
+              qtype,
+              clientIp: r.client_ip || "127.0.0.1",
+              status,
+              latencyMs: Number(r.elapsed_ms.toFixed(1)),
+              upstream: r.rcode === "NXDOMAIN" || r.rcode === "REFUSED" ? "blackhole" : undefined,
+            };
+          });
+        }
+
+        let newRcodes: RcodeDist[] = [];
+        if (rcodeRes.status === "fulfilled" && rcodeRes.value.ok && rcodeRes.value.rows?.length > 0) {
+          const rcodeColors: Record<string, string> = {
+            NOERROR: "#10b981",
+            NXDOMAIN: "#64748b",
+            REFUSED: "#f43f5e",
+            SERVFAIL: "#f59e0b",
+          };
+          newRcodes = rcodeRes.value.rows.map((row) => ({
             name: row.key,
             value: row.count,
             pct: Number((row.share * 100).toFixed(1)),
             color: rcodeColors[row.key] || "#94a3b8",
-          })),
-        );
-      } else {
-        setRcodes([]);
-      }
+          }));
+        }
 
-      if (qtypeRes.status === "fulfilled" && qtypeRes.value.ok && qtypeRes.value.rows?.length > 0) {
-        const qColors = ["#0284c7", "#64748b", "#94a3b8", "#cbd5e1", "#e2e8f0"];
-        setQtypes(
-          qtypeRes.value.rows.map((row, idx) => ({
+        let newQtypes: QtypeDist[] = [];
+        if (qtypeRes.status === "fulfilled" && qtypeRes.value.ok && qtypeRes.value.rows?.length > 0) {
+          const qColors = ["#0284c7", "#64748b", "#94a3b8", "#cbd5e1", "#e2e8f0"];
+          newQtypes = qtypeRes.value.rows.map((row, idx) => ({
             name: row.key,
             value: row.count,
             pct: Number((row.share * 100).toFixed(1)),
             color: qColors[idx % qColors.length],
-          })),
-        );
-      } else {
-        setQtypes([]);
+          }));
+        }
+
+        // Write to SWR cache
+        dataCacheRef.current[targetRange] = {
+          timeseriesData: newTimeseriesData,
+          topClients: newTopClients,
+          topQueries: newTopQueries,
+          topBlocked: newTopBlocked,
+          liveLogs: newLiveLogs,
+          rcodes: newRcodes,
+          qtypes: newQtypes,
+          recorderLatency: newRecorderLatency,
+          fetchedAt: Date.now(),
+        };
+
+        // Render if this is still the active range
+        if (targetRange === timeRangeRef.current) {
+          setRecorderLatency(newRecorderLatency);
+          setTimeseriesData(newTimeseriesData);
+          setTopClients(newTopClients);
+          setTopQueries(newTopQueries);
+          setTopBlocked(newTopBlocked);
+          setLiveLogs(newLiveLogs);
+          setRcodes(newRcodes);
+          setQtypes(newQtypes);
+        }
+      } catch {
+        // ignore
+      } finally {
+        if (targetRange === timeRangeRef.current) {
+          setIsRefreshing(false);
+        }
       }
-    } catch {
-      // ignore
-    } finally {
-      setIsRefreshing(false);
-    }
-  }, [isConnected, recorderPlugin, timeRange]);
+    },
+    [isConnected, recorderPlugin],
+  );
+
+  const handleTimeRangeChange = useCallback(
+    (newRange: TimeRange) => {
+      if (newRange === timeRangeRef.current) return;
+      timeRangeRef.current = newRange;
+      setTimeRange(newRange);
+
+      const cached = dataCacheRef.current[newRange];
+      if (cached) {
+        // 0ms instant display from cache
+        setTimeseriesData(cached.timeseriesData);
+        setTopClients(cached.topClients);
+        setTopQueries(cached.topQueries);
+        setTopBlocked(cached.topBlocked);
+        setLiveLogs(cached.liveLogs);
+        setRcodes(cached.rcodes);
+        setQtypes(cached.qtypes);
+        setRecorderLatency(cached.recorderLatency);
+        // Silently revalidate in background
+        void loadRecorderData(newRange, true);
+      } else {
+        // No cache yet: load immediately with indicator
+        void loadRecorderData(newRange, false);
+      }
+    },
+    [loadRecorderData],
+  );
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void loadRecorderData();
+    timeRangeRef.current = timeRange;
+  }, [timeRange]);
+
+  useEffect(() => {
+    // Initial fetch
+    void loadRecorderData(timeRangeRef.current, false);
   }, [loadRecorderData]);
 
   // Periodic polling for real query telemetry when connected and recorder is active
   useEffect(() => {
     if (!isAutoRefresh || !isConnected || !recorderPlugin) return;
     const interval = setInterval(() => {
-      void loadRecorderData();
+      void loadRecorderData(timeRangeRef.current, true);
     }, 4000);
 
     return () => clearInterval(interval);
   }, [isAutoRefresh, isConnected, recorderPlugin, loadRecorderData]);
+
+  // Prefetch adjacent time ranges quietly after initial load to make subsequent switches 0ms instant
+  useEffect(() => {
+    if (!isConnected || !recorderPlugin) return;
+    const timer = setTimeout(() => {
+      const ranges: TimeRange[] = ["1h", "24h", "live"];
+      ranges.forEach((r) => {
+        if (!dataCacheRef.current[r] && r !== timeRangeRef.current) {
+          void loadRecorderData(r, true);
+        }
+      });
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [isConnected, recorderPlugin, loadRecorderData]);
 
   // Derived KPI metrics
   const windowTotalQueries = useMemo(() => {
@@ -626,7 +806,7 @@ export function DnsOverview() {
               <button
                 key={range}
                 type="button"
-                onClick={() => setTimeRange(range)}
+                onClick={() => handleTimeRangeChange(range)}
                 className={cn(
                   "macos-segmented-item px-2 sm:px-3 text-xs",
                   timeRange === range && "active",
@@ -682,7 +862,7 @@ export function DnsOverview() {
 
           <button
             type="button"
-            onClick={() => void loadRecorderData()}
+            onClick={() => void loadRecorderData(timeRangeRef.current, false)}
             disabled={isRefreshing}
             className="h-8 w-8 rounded-xl border border-border/40 flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04] transition-all"
             title="手动刷新数据"
@@ -882,6 +1062,8 @@ export function DnsOverview() {
                   className="text-[11px] text-muted-foreground"
                   tickLine={false}
                   axisLine={false}
+                  minTickGap={25}
+                  interval="preserveStartEnd"
                 />
                 <YAxis
                   stroke="currentColor"
@@ -942,6 +1124,8 @@ export function DnsOverview() {
                   strokeWidth={2}
                   fillOpacity={1}
                   fill="url(#gradientTotal)"
+                  isAnimationActive={false}
+                  connectNulls
                 />
                 <Area
                   type="monotone"
@@ -950,6 +1134,8 @@ export function DnsOverview() {
                   strokeWidth={1.5}
                   fillOpacity={1}
                   fill="url(#gradientSuccess)"
+                  isAnimationActive={false}
+                  connectNulls
                 />
                 <Area
                   type="monotone"
@@ -958,6 +1144,8 @@ export function DnsOverview() {
                   strokeWidth={1.5}
                   fillOpacity={1}
                   fill="url(#gradientBlocked)"
+                  isAnimationActive={false}
+                  connectNulls
                 />
               </AreaChart>
             </ResponsiveContainer>
