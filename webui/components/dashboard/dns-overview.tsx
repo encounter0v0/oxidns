@@ -2,8 +2,8 @@
 
 import { useEffect, useMemo, useState, useCallback } from "react";
 import {
-  Activity,
   BarChart3,
+  Calendar,
   Clock,
   Copy,
   Database,
@@ -17,7 +17,6 @@ import {
   Search,
   Server,
   ShieldAlert,
-  TrendingUp,
   Zap,
   Radio,
 } from "lucide-react";
@@ -51,7 +50,75 @@ import {
 } from "@/lib/oxidns-api";
 
 // --- Types ---
-type TimeRange = "1h" | "6h" | "24h" | "live";
+type TimeRange = "1h" | "24h" | "all" | "live";
+
+// Calculate timestamp of Monday 00:00:00.000 for current week
+function getMondayMidnight(now = new Date()): number {
+  const d = new Date(now);
+  const day = d.getDay(); // 0 is Sunday, 1 is Monday, ..., 6 is Saturday
+  const diffToMonday = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diffToMonday);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+// Derive and persist weekly request count across Monday-Sunday cycle
+function getWeeklyRequestCount(rawTotal: number): number {
+  if (typeof window === "undefined") return rawTotal;
+  const currentWeekStart = getMondayMidnight();
+  const STORAGE_KEY = "oxidns_weekly_request_stats_v1";
+
+  let savedState: {
+    weekStartMs: number;
+    accumulated: number;
+    lastRaw: number;
+  } | null = null;
+
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) savedState = JSON.parse(raw);
+  } catch {
+    // ignore
+  }
+
+  if (!savedState || savedState.weekStartMs !== currentWeekStart) {
+    const isWeekAdvance = Boolean(savedState && savedState.weekStartMs < currentWeekStart);
+    const initialCount = isWeekAdvance ? 0 : rawTotal;
+    const newState = {
+      weekStartMs: currentWeekStart,
+      accumulated: initialCount,
+      lastRaw: rawTotal,
+    };
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(newState));
+    } catch {
+      // ignore
+    }
+    return initialCount;
+  }
+
+  let delta = rawTotal - savedState.lastRaw;
+  if (delta < 0) {
+    delta = rawTotal;
+  }
+
+  if (delta > 0 || rawTotal !== savedState.lastRaw) {
+    const nextCount = savedState.accumulated + Math.max(0, delta);
+    const updated = {
+      ...savedState,
+      accumulated: nextCount,
+      lastRaw: rawTotal,
+    };
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+    } catch {
+      // ignore
+    }
+    return nextCount;
+  }
+
+  return savedState.accumulated;
+}
 
 interface TrafficPoint {
   time: string;
@@ -138,6 +205,18 @@ export function DnsOverview() {
   const [qtypes, setQtypes] = useState<QtypeDist[]>([]);
   const [recorderLatency, setRecorderLatency] = useState<QueryRecorderLatencySummary | null>(null);
   const [, setCopiedDomain] = useState<string | null>(null);
+
+  const weeklyRangeLabel = useMemo(() => {
+    const mon = new Date(getMondayMidnight());
+    const sun = new Date(mon.getTime() + 6 * 24 * 3600 * 1000);
+    const monStr = `${mon.getMonth() + 1}/${mon.getDate()}`;
+    const sunStr = `${sun.getMonth() + 1}/${sun.getDate()}`;
+    return `周一至周日 (${monStr} - ${sunStr})`;
+  }, []);
+
+  const weeklyQueries = useMemo(() => {
+    return getWeeklyRequestCount(trafficMetrics?.requestTotal ?? 0);
+  }, [trafficMetrics?.requestTotal]);
 
   // Query tester modal / dialog state
   const [testDomain, setTestDomain] = useState("");
@@ -284,7 +363,7 @@ export function DnsOverview() {
       const tag = recorderPlugin.name || recorderPlugin.id;
 
       const now = Date.now();
-      let sinceMs: number;
+      let sinceMs: number | undefined;
       let bucket: "minute" | "hour" = "minute";
       let buckets = 60;
 
@@ -292,14 +371,14 @@ export function DnsOverview() {
         sinceMs = now - 60 * 60 * 1000;
         bucket = "minute";
         buckets = 60;
-      } else if (timeRange === "6h") {
-        sinceMs = now - 6 * 60 * 60 * 1000;
-        bucket = "minute";
-        buckets = 360;
       } else if (timeRange === "24h") {
         sinceMs = now - 24 * 60 * 60 * 1000;
         bucket = "hour";
         buckets = 24;
+      } else if (timeRange === "all") {
+        sinceMs = undefined;
+        bucket = "hour";
+        buckets = 720;
       } else {
         // live (15 min)
         sinceMs = now - 15 * 60 * 1000;
@@ -307,10 +386,11 @@ export function DnsOverview() {
         buckets = 15;
       }
 
-      const [tsRes, clientsRes, qnamesRes, recordsRes, rcodeRes, qtypeRes, latencyRes] = await Promise.allSettled([
+      const [tsRes, clientsRes, qnamesRes, blockedQnamesRes, recordsRes, rcodeRes, qtypeRes, latencyRes] = await Promise.allSettled([
         fetchQueryRecorderTimeseries(tag, { bucket, buckets, sinceMs }),
         fetchQueryRecorderTopClients(tag, { limit: 6, sinceMs }),
         fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs }),
+        fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs, status: "error" }),
         fetchQueryRecords(tag, { limit: 12, sinceMs }),
         fetchQueryRecorderRcodeDistribution(tag, { sinceMs }),
         fetchQueryRecorderQtypeDistribution(tag, { sinceMs }),
@@ -325,19 +405,30 @@ export function DnsOverview() {
 
       if (tsRes.status === "fulfilled" && tsRes.value.ok && tsRes.value.points?.length > 0) {
         const divisor = bucket === "hour" ? 3600 : 60;
-        const mapped = tsRes.value.points.map((b) => ({
-          time: new Date(b.bucket_ms).toLocaleTimeString([], {
-            hour: "2-digit",
-            minute: "2-digit",
-          }),
-          timestamp: b.bucket_ms,
-          total: b.total,
-          success: Math.max(0, b.total - b.error_count),
-          blocked: b.error_count,
-          avgMs: Number(b.avg_ms.toFixed(1)),
-          p95Ms: b.p95_ms,
-          qps: Number((b.total / divisor).toFixed(1)),
-        }));
+        const mapped = tsRes.value.points.map((b) => {
+          const d = new Date(b.bucket_ms);
+          let timeLabel: string;
+          if (timeRange === "all") {
+            timeLabel = `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:00`;
+          } else if (timeRange === "24h") {
+            timeLabel = `${String(d.getHours()).padStart(2, "0")}:00`;
+          } else {
+            timeLabel = d.toLocaleTimeString([], {
+              hour: "2-digit",
+              minute: "2-digit",
+            });
+          }
+          return {
+            time: timeLabel,
+            timestamp: b.bucket_ms,
+            total: b.total,
+            success: Math.max(0, b.total - b.error_count),
+            blocked: b.error_count,
+            avgMs: Number(b.avg_ms.toFixed(1)),
+            p95Ms: b.p95_ms,
+            qps: Number((b.total / divisor).toFixed(1)),
+          };
+        });
         setTimeseriesData(mapped);
       } else {
         setTimeseriesData([]);
@@ -351,7 +442,7 @@ export function DnsOverview() {
             name: row.key,
             ip: row.key,
             count: row.count,
-            percentage: Number(((row.count / totalSample) * 100).toFixed(1)),
+            percentage: Number(((row.share ? row.share * 100 : (row.count / totalSample) * 100)).toFixed(1)),
           })),
         );
       } else {
@@ -365,7 +456,7 @@ export function DnsOverview() {
             rank: idx + 1,
             name: row.key,
             count: row.count,
-            percentage: Number(((row.count / totalSample) * 100).toFixed(1)),
+            percentage: Number(((row.share ? row.share * 100 : (row.count / totalSample) * 100)).toFixed(1)),
             category: "域名解析",
           })),
         );
@@ -373,28 +464,19 @@ export function DnsOverview() {
         setTopQueries([]);
       }
 
-      if (recordsRes.status === "fulfilled" && recordsRes.value.ok && recordsRes.value.records?.length > 0) {
-        const records = recordsRes.value.records;
-        setLiveLogs(
-          records.map((r: QueryRecordRow) => {
-            const qname = r.questions_json?.[0]?.name || "unknown";
-            const qtype = r.questions_json?.[0]?.qtype || "A";
-            const isBlocked = r.rcode === "NXDOMAIN" || r.rcode === "REFUSED" || Boolean(r.error);
-            const time = new Date(r.created_at_ms).toTimeString().split(" ")[0];
-            return {
-              id: String(r.id),
-              time,
-              qname,
-              qtype,
-              clientIp: r.client_ip,
-              status: isBlocked ? "blocked" : "success",
-              latencyMs: Number(r.elapsed_ms.toFixed(1)),
-              upstream: isBlocked ? "blackhole" : "upstream",
-            };
-          }),
+      if (blockedQnamesRes.status === "fulfilled" && blockedQnamesRes.value.ok && blockedQnamesRes.value.rows?.length > 0) {
+        const totalSample = blockedQnamesRes.value.sample_size || blockedQnamesRes.value.rows.reduce((acc, r) => acc + r.count, 0) || 1;
+        setTopBlocked(
+          blockedQnamesRes.value.rows.map((row, idx) => ({
+            rank: idx + 1,
+            name: row.key,
+            count: row.count,
+            percentage: Number(((row.share ? row.share * 100 : (row.count / totalSample) * 100)).toFixed(1)),
+            ruleTag: "规则阻断",
+          })),
         );
-
-        // Derive topBlocked from real blocked query records
+      } else if (recordsRes.status === "fulfilled" && recordsRes.value.ok && recordsRes.value.records?.length > 0) {
+        const records = recordsRes.value.records;
         const blockedRows = records.filter(
           (r: QueryRecordRow) => r.rcode === "NXDOMAIN" || r.rcode === "REFUSED" || Boolean(r.error),
         );
@@ -418,7 +500,6 @@ export function DnsOverview() {
           setTopBlocked([]);
         }
       } else {
-        setLiveLogs([]);
         setTopBlocked([]);
       }
 
@@ -627,7 +708,7 @@ export function DnsOverview() {
         <div className="flex flex-wrap items-center gap-2">
           {/* Time range segmented control */}
           <div className="macos-segmented">
-            {(["1h", "6h", "24h", "live"] as TimeRange[]).map((range) => (
+            {(["1h", "24h", "all", "live"] as TimeRange[]).map((range) => (
               <button
                 key={range}
                 type="button"
@@ -643,18 +724,13 @@ export function DnsOverview() {
                     <span className="hidden sm:inline">最近 1h</span>
                   </>
                 )}
-                {range === "6h" && (
-                  <>
-                    <span className="sm:hidden">6h</span>
-                    <span className="hidden sm:inline">最近 6h</span>
-                  </>
-                )}
                 {range === "24h" && (
                   <>
                     <span className="sm:hidden">24h</span>
                     <span className="hidden sm:inline">最近 24h</span>
                   </>
                 )}
+                {range === "all" && <span>全部</span>}
                 {range === "live" && (
                   <>
                     <Radio className="h-3 w-3 text-rose-500 animate-pulse" />
@@ -707,23 +783,31 @@ export function DnsOverview() {
 
       {/* ── 6 Master Liquid Glass Metric Cards (Minimalist & High-Contrast) ── */}
       <div className="grid grid-cols-2 gap-2.5 sm:gap-3.5 sm:grid-cols-3 lg:grid-cols-6">
-        {/* Card 1: Total Queries */}
+        {/* Card 1: Total Queries (Weekly Cycle) */}
         <div className="liquid-glass-card p-3 sm:p-4 relative overflow-hidden group">
           <div className="flex items-center justify-between mb-1.5 sm:mb-2">
-            <span className="text-xs font-medium text-muted-foreground truncate">总解析请求</span>
+            <span
+              className="text-xs font-medium text-muted-foreground truncate"
+              title={`总解析请求（每周统计，下周一 00:00 自动重置）\n开机历史累计: ${formatNumber(lifetimeTotalQueries)}`}
+            >
+              总解析请求（每周）
+            </span>
             <div className="h-6 w-6 sm:h-7 sm:w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center shrink-0">
-              <Activity className="h-3 w-3 sm:h-3.5 sm:w-3.5" />
+              <Calendar className="h-3 w-3 sm:h-3.5 sm:w-3.5 text-primary" />
             </div>
           </div>
           <div suppressHydrationWarning className="text-xl sm:text-2xl font-bold tracking-tight tabular-nums text-foreground">
-            {formatNumber(windowTotalQueries > 0 ? windowTotalQueries : lifetimeTotalQueries)}
+            {formatNumber(weeklyQueries > 0 ? weeklyQueries : (trafficMetrics?.requestTotal ?? windowTotalQueries))}
           </div>
-          <div className="flex items-center gap-1 text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
-            <TrendingUp className="h-3 w-3 text-primary shrink-0" />
-            <span className="truncate">
-              {windowTotalQueries > 0
-                ? `时段累计 (总计: ${formatNumber(lifetimeTotalQueries)})`
-                : "累计解析总量"}
+          <div className="flex items-center justify-between text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5 truncate">
+            <span className="truncate" title={weeklyRangeLabel}>
+              {weeklyRangeLabel}
+            </span>
+            <span
+              className="text-[10px] font-mono text-muted-foreground shrink-0 hidden sm:inline"
+              title={`周一至周日为一个统计周期，下周一 00:00 自动开启新周期\n开机历史累计: ${formatNumber(lifetimeTotalQueries)}`}
+            >
+              周一重置
             </span>
           </div>
         </div>
