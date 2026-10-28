@@ -569,17 +569,33 @@ export function DnsOverview() {
                 type="button"
                 onClick={() => setTimeRange(range)}
                 className={cn(
-                  "macos-segmented-item",
+                  "macos-segmented-item px-2 sm:px-3 text-xs",
                   timeRange === range && "active",
                 )}
               >
-                {range === "1h" && "最近 1h"}
-                {range === "6h" && "最近 6h"}
-                {range === "24h" && "最近 24h"}
+                {range === "1h" && (
+                  <>
+                    <span className="sm:hidden">1h</span>
+                    <span className="hidden sm:inline">最近 1h</span>
+                  </>
+                )}
+                {range === "6h" && (
+                  <>
+                    <span className="sm:hidden">6h</span>
+                    <span className="hidden sm:inline">最近 6h</span>
+                  </>
+                )}
+                {range === "24h" && (
+                  <>
+                    <span className="sm:hidden">24h</span>
+                    <span className="hidden sm:inline">最近 24h</span>
+                  </>
+                )}
                 {range === "live" && (
                   <>
                     <Radio className="h-3 w-3 text-rose-500 animate-pulse" />
-                    实时 (5s)
+                    <span className="sm:hidden">实时</span>
+                    <span className="hidden sm:inline">实时 (5s)</span>
                   </>
                 )}
               </button>
@@ -626,37 +642,37 @@ export function DnsOverview() {
       </div>
 
       {/* ── 6 Master Liquid Glass Metric Cards (Minimalist & High-Contrast) ── */}
-      <div className="grid grid-cols-2 gap-3.5 sm:grid-cols-3 lg:grid-cols-6">
+      <div className="grid grid-cols-2 gap-2.5 sm:gap-3.5 sm:grid-cols-3 lg:grid-cols-6">
         {/* Card 1: Total Queries */}
-        <div className="liquid-glass-card p-4 relative overflow-hidden group">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-medium text-muted-foreground">总解析请求</span>
-            <div className="h-7 w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center">
-              <Activity className="h-3.5 w-3.5" />
+        <div className="liquid-glass-card p-3 sm:p-4 relative overflow-hidden group">
+          <div className="flex items-center justify-between mb-1.5 sm:mb-2">
+            <span className="text-xs font-medium text-muted-foreground truncate">总解析请求</span>
+            <div className="h-6 w-6 sm:h-7 sm:w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center shrink-0">
+              <Activity className="h-3 w-3 sm:h-3.5 sm:w-3.5" />
             </div>
           </div>
-          <div suppressHydrationWarning className="text-2xl font-bold tracking-tight tabular-nums text-foreground">
+          <div suppressHydrationWarning className="text-xl sm:text-2xl font-bold tracking-tight tabular-nums text-foreground">
             {formatNumber(totalQueries)}
           </div>
-          <div className="flex items-center gap-1 text-[11px] text-muted-foreground mt-1.5">
-            <TrendingUp className="h-3 w-3 text-primary" />
-            <span>累计解析总量</span>
+          <div className="flex items-center gap-1 text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
+            <TrendingUp className="h-3 w-3 text-primary shrink-0" />
+            <span className="truncate">累计解析总量</span>
           </div>
         </div>
 
         {/* Card 2: Real-time QPS */}
-        <div className="liquid-glass-card p-4 relative overflow-hidden group">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-medium text-muted-foreground">实时 QPS</span>
-            <div className="h-7 w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center">
-              <Zap className="h-3.5 w-3.5 text-primary" />
+        <div className="liquid-glass-card p-3 sm:p-4 relative overflow-hidden group">
+          <div className="flex items-center justify-between mb-1.5 sm:mb-2">
+            <span className="text-xs font-medium text-muted-foreground truncate">实时 QPS</span>
+            <div className="h-6 w-6 sm:h-7 sm:w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center shrink-0">
+              <Zap className="h-3 w-3 sm:h-3.5 sm:w-3.5 text-primary" />
             </div>
           </div>
-          <div suppressHydrationWarning className="text-2xl font-bold tracking-tight tabular-nums text-foreground">
+          <div suppressHydrationWarning className="text-xl sm:text-2xl font-bold tracking-tight tabular-nums text-foreground">
             {currentQps}
             <span className="text-xs font-normal text-muted-foreground ml-1">req/s</span>
           </div>
-          <div className="flex items-center justify-between text-[11px] text-muted-foreground mt-1.5">
+          <div className="flex items-center justify-between text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
             <span>吞吐速率</span>
             <span className={cn("font-medium", currentQps > 0 ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground")}>
               {currentQps > 0 ? "服务中" : "就绪"}
@@ -665,35 +681,35 @@ export function DnsOverview() {
         </div>
 
         {/* Card 3: Threat & Ad Block Rate */}
-        <div className="liquid-glass-card p-4 relative overflow-hidden group">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-medium text-muted-foreground">威胁与规则拦截</span>
-            <div className="h-7 w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center">
-              <ShieldAlert className="h-3.5 w-3.5 text-rose-500" />
+        <div className="liquid-glass-card p-3 sm:p-4 relative overflow-hidden group">
+          <div className="flex items-center justify-between mb-1.5 sm:mb-2">
+            <span className="text-xs font-medium text-muted-foreground truncate">威胁与规则拦截</span>
+            <div className="h-6 w-6 sm:h-7 sm:w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center shrink-0">
+              <ShieldAlert className="h-3 w-3 sm:h-3.5 sm:w-3.5 text-rose-500" />
             </div>
           </div>
-          <div suppressHydrationWarning className="text-2xl font-bold tracking-tight tabular-nums text-foreground">
+          <div suppressHydrationWarning className="text-xl sm:text-2xl font-bold tracking-tight tabular-nums text-foreground">
             {blockRate}%
           </div>
-          <div className="flex items-center justify-between text-[11px] text-muted-foreground mt-1.5">
-            <span suppressHydrationWarning>{formatNumber(blockCount)} 次拦截</span>
-            <span className="text-[10px] font-mono text-muted-foreground">REFUSED / 阻断</span>
+          <div className="flex items-center justify-between text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
+            <span suppressHydrationWarning className="truncate">{formatNumber(blockCount)} 次拦截</span>
+            <span className="text-[10px] font-mono text-muted-foreground shrink-0 hidden sm:inline">REFUSED</span>
           </div>
         </div>
 
         {/* Card 4: Average Latency */}
-        <div className="liquid-glass-card p-4 relative overflow-hidden group">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-medium text-muted-foreground">平均响应耗时</span>
-            <div className="h-7 w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center">
-              <Clock className="h-3.5 w-3.5" />
+        <div className="liquid-glass-card p-3 sm:p-4 relative overflow-hidden group">
+          <div className="flex items-center justify-between mb-1.5 sm:mb-2">
+            <span className="text-xs font-medium text-muted-foreground truncate">平均响应耗时</span>
+            <div className="h-6 w-6 sm:h-7 sm:w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center shrink-0">
+              <Clock className="h-3 w-3 sm:h-3.5 sm:w-3.5" />
             </div>
           </div>
-          <div suppressHydrationWarning className="text-2xl font-bold tracking-tight tabular-nums text-foreground">
+          <div suppressHydrationWarning className="text-xl sm:text-2xl font-bold tracking-tight tabular-nums text-foreground">
             {avgLatency > 0 ? avgLatency : "-"}
             {avgLatency > 0 && <span className="text-xs font-normal text-muted-foreground ml-1">ms</span>}
           </div>
-          <div className="flex items-center justify-between text-[11px] text-muted-foreground mt-1.5">
+          <div className="flex items-center justify-between text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
             <span>{avgLatency > 0 ? (avgLatency < 10 ? "极佳" : "正常") : "暂无采样"}</span>
             <span className="text-emerald-600 dark:text-emerald-400 font-medium">
               {avgLatency > 0 && avgLatency < 20 ? "低延迟" : ""}
@@ -702,38 +718,38 @@ export function DnsOverview() {
         </div>
 
         {/* Card 5: Cache Hit Ratio */}
-        <div className="liquid-glass-card p-4 relative overflow-hidden group">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-medium text-muted-foreground">智能缓存命中率</span>
-            <div className="h-7 w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center">
-              <Database className="h-3.5 w-3.5" />
+        <div className="liquid-glass-card p-3 sm:p-4 relative overflow-hidden group">
+          <div className="flex items-center justify-between mb-1.5 sm:mb-2">
+            <span className="text-xs font-medium text-muted-foreground truncate">智能缓存命中率</span>
+            <div className="h-6 w-6 sm:h-7 sm:w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center shrink-0">
+              <Database className="h-3 w-3 sm:h-3.5 sm:w-3.5" />
             </div>
           </div>
-          <div suppressHydrationWarning className="text-2xl font-bold tracking-tight tabular-nums text-foreground">
+          <div suppressHydrationWarning className="text-xl sm:text-2xl font-bold tracking-tight tabular-nums text-foreground">
             {cacheHitRate}%
           </div>
-          <div className="flex items-center justify-between text-[11px] text-muted-foreground mt-1.5">
-            <span suppressHydrationWarning>{formatNumber(cacheHitCount)} 命中</span>
-            <span className="font-mono text-[10px]">本地缓存</span>
+          <div className="flex items-center justify-between text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
+            <span suppressHydrationWarning className="truncate">{formatNumber(cacheHitCount)} 命中</span>
+            <span className="font-mono text-[10px] shrink-0">本地缓存</span>
           </div>
         </div>
 
         {/* Card 6: Upstream Health */}
-        <div className="liquid-glass-card p-4 relative overflow-hidden group">
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-medium text-muted-foreground">上游可用节点</span>
-            <div className="h-7 w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center">
-              <Server className="h-3.5 w-3.5" />
+        <div className="liquid-glass-card p-3 sm:p-4 relative overflow-hidden group">
+          <div className="flex items-center justify-between mb-1.5 sm:mb-2">
+            <span className="text-xs font-medium text-muted-foreground truncate">上游可用节点</span>
+            <div className="h-6 w-6 sm:h-7 sm:w-7 rounded-lg bg-foreground/[0.04] text-foreground/75 border border-foreground/[0.06] flex items-center justify-center shrink-0">
+              <Server className="h-3 w-3 sm:h-3.5 sm:w-3.5" />
             </div>
           </div>
-          <div suppressHydrationWarning className="text-2xl font-bold tracking-tight tabular-nums text-foreground">
+          <div suppressHydrationWarning className="text-xl sm:text-2xl font-bold tracking-tight tabular-nums text-foreground">
             {configuredUpstreams.length} <span className="text-xs font-normal text-muted-foreground ml-1">节点</span>
           </div>
-          <div className="flex items-center justify-between text-[11px] text-muted-foreground mt-1.5 truncate">
+          <div className="flex items-center justify-between text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5 truncate">
             <span className="truncate">
               {fastestUpstream ? `最快: ${fastestUpstream.tag || fastestUpstream.addr}` : "已接入上游"}
             </span>
-            <span className="text-emerald-600 dark:text-emerald-400 font-medium font-mono">
+            <span className="text-emerald-600 dark:text-emerald-400 font-medium font-mono shrink-0">
               {fastestUpstream ? `${fastestUpstream.latencyMs}ms` : "-"}
             </span>
           </div>
@@ -741,7 +757,7 @@ export function DnsOverview() {
       </div>
 
       {/* ── Chart Section 1: Minimalist Liquid Glass Area Chart ── */}
-      <div className="liquid-glass-card p-5">
+      <div className="liquid-glass-card p-3.5 sm:p-5">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-6">
           <div>
             <div className="flex items-center gap-2">
@@ -775,7 +791,7 @@ export function DnsOverview() {
         </div>
 
         {timeseriesData.length > 0 ? (
-          <div className="h-72 w-full">
+          <div className="h-56 sm:h-72 w-full">
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={timeseriesData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
                 <defs>
@@ -1343,8 +1359,8 @@ export function DnsOverview() {
             </span>
           </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs">
+          <div className="overflow-x-auto -mx-1 sm:mx-0">
+            <table className="w-full text-left text-xs min-w-[580px]">
               <thead>
                 <tr className="border-b border-border/40 text-muted-foreground font-medium">
                   <th className="pb-2 pl-1">时间</th>

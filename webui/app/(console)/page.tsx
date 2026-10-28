@@ -100,9 +100,9 @@ export default function DashboardPage() {
   return (
     <>
       <AppHeader title={t(WEBUI.shell.dashboard)} />
-      <main className="oxidns-dialog-scrollbar min-h-0 flex-1 overflow-auto p-4 sm:p-6">
+      <main className="oxidns-dialog-scrollbar min-h-0 flex-1 overflow-auto p-3 sm:p-6">
         {/* macOS View Mode Switcher Header */}
-        <div className="flex items-center justify-between pb-4 mb-2 border-b border-border/40">
+        <div className="flex items-center justify-between pb-3 sm:pb-4 mb-2 border-b border-border/40">
           <div className="macos-segmented">
             <button
               type="button"
@@ -113,7 +113,8 @@ export default function DashboardPage() {
               )}
             >
               <Activity className="h-4 w-4" />
-              <span>DNS 监控总览</span>
+              <span className="sm:hidden">DNS 监控</span>
+              <span className="hidden sm:inline">DNS 监控总览</span>
             </button>
             <button
               type="button"
@@ -124,7 +125,8 @@ export default function DashboardPage() {
               )}
             >
               <Server className="h-4 w-4" />
-              <span>系统与插件拓扑</span>
+              <span className="sm:hidden">系统拓扑</span>
+              <span className="hidden sm:inline">系统与插件拓扑</span>
             </button>
           </div>
         </div>

@@ -70,21 +70,21 @@ export function AppHeader({ title, breadcrumbs = [] }: AppHeaderProps) {
   const showNavigation = !editorMode;
 
   return (
-    <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border/40 px-4 liquid-glass-header sticky top-0 z-30">
+    <header className="flex h-14 shrink-0 items-center gap-1.5 sm:gap-3 border-b border-border/40 px-2.5 sm:px-4 liquid-glass-header sticky top-0 z-30">
       {showNavigation ? (
         <>
-          <div className="flex min-w-0 items-center gap-2.5">
+          <div className="flex min-w-0 items-center gap-1.5 sm:gap-2.5">
             <SidebarTrigger className="rounded-xl text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors" />
           </div>
           <Breadcrumb className="min-w-0 flex-1">
-            <BreadcrumbList className="gap-2 text-[13px]">
-              <BreadcrumbItem>
+            <BreadcrumbList className="gap-1 sm:gap-2 text-[13px] flex-nowrap">
+              <BreadcrumbItem className="hidden sm:inline-flex">
                 <BreadcrumbLink asChild className="text-foreground/70 hover:text-foreground">
                   <Link href="/">OxiDNS</Link>
                 </BreadcrumbLink>
               </BreadcrumbItem>
               {breadcrumbs.map((crumb, i) => (
-                <span key={i} className="contents">
+                <span key={i} className="hidden sm:contents">
                   <BreadcrumbSeparator />
                   <BreadcrumbItem>
                     {crumb.href ? (
@@ -97,16 +97,18 @@ export function AppHeader({ title, breadcrumbs = [] }: AppHeaderProps) {
                   </BreadcrumbItem>
                 </span>
               ))}
-              <BreadcrumbSeparator />
-              <BreadcrumbItem>
-                <BreadcrumbPage className="font-semibold text-foreground">{title}</BreadcrumbPage>
+              <BreadcrumbSeparator className="hidden sm:inline-flex" />
+              <BreadcrumbItem className="min-w-0">
+                <BreadcrumbPage className="font-semibold text-foreground truncate max-w-[100px] xs:max-w-[140px] sm:max-w-none">
+                  {title}
+                </BreadcrumbPage>
               </BreadcrumbItem>
             </BreadcrumbList>
           </Breadcrumb>
         </>
       ) : (
         <div className="min-w-0 flex-1">
-          <h1 className="text-sm font-semibold text-foreground">{title}</h1>
+          <h1 className="text-sm font-semibold text-foreground truncate">{title}</h1>
         </div>
       )}
 
@@ -120,7 +122,7 @@ export function AppHeader({ title, breadcrumbs = [] }: AppHeaderProps) {
         </span>
       </div>
 
-      <div className="ml-auto flex items-center gap-2">
+      <div className="ml-auto flex items-center gap-1.5 sm:gap-2 shrink-0">
         <ConfigSyncControl />
 
         {showUpgradeNotice && (
@@ -161,7 +163,7 @@ export function AppHeader({ title, breadcrumbs = [] }: AppHeaderProps) {
                   type="button"
                   onClick={() => setTheme("light")}
                   className={cn(
-                    "p-1.5 rounded-lg text-xs transition-all flex items-center justify-center",
+                    "p-1 sm:p-1.5 rounded-lg text-xs transition-all flex items-center justify-center",
                     theme === "light"
                       ? "bg-background text-amber-500 shadow-xs font-semibold"
                       : "text-muted-foreground hover:text-foreground",
@@ -180,7 +182,7 @@ export function AppHeader({ title, breadcrumbs = [] }: AppHeaderProps) {
                   type="button"
                   onClick={() => setTheme("system")}
                   className={cn(
-                    "p-1.5 rounded-lg text-xs transition-all flex items-center justify-center gap-1",
+                    "p-1 sm:p-1.5 rounded-lg text-xs transition-all flex items-center justify-center gap-1",
                     theme === "system"
                       ? "bg-background text-primary shadow-xs font-semibold"
                       : "text-muted-foreground hover:text-foreground",
@@ -204,7 +206,7 @@ export function AppHeader({ title, breadcrumbs = [] }: AppHeaderProps) {
                   type="button"
                   onClick={() => setTheme("dark")}
                   className={cn(
-                    "p-1.5 rounded-lg text-xs transition-all flex items-center justify-center",
+                    "p-1 sm:p-1.5 rounded-lg text-xs transition-all flex items-center justify-center",
                     theme === "dark"
                       ? "bg-background text-purple-400 shadow-xs font-semibold"
                       : "text-muted-foreground hover:text-foreground",
@@ -258,7 +260,7 @@ export function AppHeader({ title, breadcrumbs = [] }: AppHeaderProps) {
               <Button
                 variant={editorMode ? "secondary" : "ghost"}
                 size="icon-sm"
-                className="rounded-lg h-7 w-7 text-muted-foreground hover:text-foreground"
+                className="rounded-lg h-7 w-7 text-muted-foreground hover:text-foreground hidden sm:inline-flex"
                 onClick={() => setEditorMode(!editorMode)}
               >
                 {editorMode ? (

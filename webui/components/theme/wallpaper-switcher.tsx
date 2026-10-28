@@ -53,7 +53,7 @@ export function WallpaperSwitcher() {
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="h-8 px-2.5 rounded-xl border border-white/20 dark:border-white/10 bg-white/40 dark:bg-slate-900/40 hover:bg-white/60 dark:hover:bg-slate-900/60 text-xs font-medium flex items-center gap-1.5 transition-all text-foreground shadow-xs backdrop-blur-md"
+          className="h-8 px-2 sm:px-2.5 rounded-xl border border-white/20 dark:border-white/10 bg-white/40 dark:bg-slate-900/40 hover:bg-white/60 dark:hover:bg-slate-900/60 text-xs font-medium flex items-center gap-1.5 transition-all text-foreground shadow-xs backdrop-blur-md"
           title="切换阅读背景与液态玻璃光学特效"
         >
           <Sparkles className="h-3.5 w-3.5 text-primary animate-pulse" />
@@ -67,7 +67,7 @@ export function WallpaperSwitcher() {
       <PopoverContent
         align="end"
         sideOffset={8}
-        className="w-[340px] p-4 liquid-glass-card border border-white/30 dark:border-white/10 shadow-2xl space-y-4 max-h-[85vh] overflow-y-auto"
+        className="w-[calc(100vw-1.5rem)] sm:w-[340px] max-w-[340px] p-3.5 sm:p-4 liquid-glass-card border border-white/30 dark:border-white/10 shadow-2xl space-y-4 max-h-[85vh] overflow-y-auto"
       >
         {/* Header */}
         <div className="flex items-center justify-between border-b border-border/30 pb-2.5">
