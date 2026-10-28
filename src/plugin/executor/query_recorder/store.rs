@@ -34,7 +34,7 @@ use crate::infra::error::{DnsError, Result};
 const SCHEMA_VERSION: &str = "v2";
 const CLEANUP_BATCH_SIZE: usize = 1_000;
 const VACUUM_BATCH_PAGES: u64 = 1_000;
-const PLUGIN_STATS_SAMPLE_LIMIT: usize = 10_000;
+const PLUGIN_STATS_SAMPLE_LIMIT: usize = 1_000_000;
 pub(super) fn open_writer_database(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     // Tuned for the dedicated writer thread. Keep WAL and incremental vacuum
