@@ -50,7 +50,7 @@ import {
 } from "@/lib/oxidns-api";
 
 // --- Types ---
-type TimeRange = "1h" | "24h" | "all" | "live";
+type TimeRange = "1h" | "24h" | "live";
 
 // Calculate timestamp of Monday 00:00:00.000 for current week
 function getMondayMidnight(now = new Date()): number {
@@ -375,10 +375,6 @@ export function DnsOverview() {
         sinceMs = now - 24 * 60 * 60 * 1000;
         bucket = "hour";
         buckets = 24;
-      } else if (timeRange === "all") {
-        sinceMs = undefined;
-        bucket = "hour";
-        buckets = 720;
       } else {
         // live (15 min)
         sinceMs = now - 15 * 60 * 1000;
@@ -407,17 +403,13 @@ export function DnsOverview() {
         const divisor = bucket === "hour" ? 3600 : 60;
         const mapped = tsRes.value.points.map((b) => {
           const d = new Date(b.bucket_ms);
-          let timeLabel: string;
-          if (timeRange === "all") {
-            timeLabel = `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:00`;
-          } else if (timeRange === "24h") {
-            timeLabel = `${String(d.getHours()).padStart(2, "0")}:00`;
-          } else {
-            timeLabel = d.toLocaleTimeString([], {
-              hour: "2-digit",
-              minute: "2-digit",
-            });
-          }
+          const timeLabel =
+            timeRange === "24h"
+              ? `${String(d.getHours()).padStart(2, "0")}:00`
+              : d.toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                });
           return {
             time: timeLabel,
             timestamp: b.bucket_ms,
@@ -708,7 +700,7 @@ export function DnsOverview() {
         <div className="flex flex-wrap items-center gap-2">
           {/* Time range segmented control */}
           <div className="macos-segmented">
-            {(["1h", "24h", "all", "live"] as TimeRange[]).map((range) => (
+            {(["1h", "24h", "live"] as TimeRange[]).map((range) => (
               <button
                 key={range}
                 type="button"
@@ -730,7 +722,6 @@ export function DnsOverview() {
                     <span className="hidden sm:inline">最近 24h</span>
                   </>
                 )}
-                {range === "all" && <span>全部</span>}
                 {range === "live" && (
                   <>
                     <Radio className="h-3 w-3 text-rose-500 animate-pulse" />
