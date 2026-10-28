@@ -118,6 +118,28 @@ interface LiveQueryLog {
 }
 
 
+// --- Number Formatting & Time Helpers ---
+export function formatCompactCount(num: number): string {
+  if (!Number.isFinite(num) || num <= 0) return "0";
+  if (num >= 100_000_000) {
+    const val = (num / 100_000_000).toFixed(1);
+    return `${val.endsWith(".0") ? val.slice(0, -2) : val}亿`;
+  }
+  if (num >= 10_000) {
+    const val = (num / 10_000).toFixed(1);
+    return `${val.endsWith(".0") ? val.slice(0, -2) : val}w`;
+  }
+  return num.toLocaleString();
+}
+
+function getStartOfWeekMs(now = Date.now()): number {
+  const d = new Date(now);
+  const day = d.getDay(); // 0 is Sunday, 1 is Monday ...
+  const diffToMonday = day === 0 ? 6 : day - 1;
+  const monday = new Date(d.getFullYear(), d.getMonth(), d.getDate() - diffToMonday, 0, 0, 0, 0);
+  return monday.getTime();
+}
+
 // --- SWR Cache & Normalized Timeseries Helper for Instant Silky-Smooth Chart Rendering ---
 interface RangeCacheData {
   timeseriesData: TrafficPoint[];
@@ -128,6 +150,7 @@ interface RangeCacheData {
   rcodes: RcodeDist[];
   qtypes: QtypeDist[];
   recorderLatency: QueryRecorderLatencySummary | null;
+  weeklyTotalQueries?: number;
   fetchedAt: number;
 }
 
@@ -243,6 +266,7 @@ export function DnsOverview() {
   const [rcodes, setRcodes] = useState<RcodeDist[]>([]);
   const [qtypes, setQtypes] = useState<QtypeDist[]>([]);
   const [recorderLatency, setRecorderLatency] = useState<QueryRecorderLatencySummary | null>(null);
+  const [weeklyTotalQueries, setWeeklyTotalQueries] = useState<number>(0);
   const [, setCopiedDomain] = useState<string | null>(null);
 
   // Query tester modal / dialog state
@@ -414,17 +438,28 @@ export function DnsOverview() {
           buckets = 15;
         }
 
-        const [tsRes, clientsRes, qnamesRes, blockedQnamesRes, recordsRes, rcodeRes, qtypeRes, latencyRes] =
-          await Promise.allSettled([
-            fetchQueryRecorderTimeseries(tag, { bucket, buckets, sinceMs }),
-            fetchQueryRecorderTopClients(tag, { limit: 6, sinceMs }),
-            fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs }),
-            fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs, status: "error" }),
-            fetchQueryRecords(tag, { limit: 12, sinceMs }),
-            fetchQueryRecorderRcodeDistribution(tag, { sinceMs }),
-            fetchQueryRecorderQtypeDistribution(tag, { sinceMs }),
-            fetchQueryRecorderLatency(tag, { sinceMs }),
-          ]);
+        const startOfWeekMs = getStartOfWeekMs(now);
+        const [
+          tsRes,
+          clientsRes,
+          qnamesRes,
+          blockedQnamesRes,
+          recordsRes,
+          rcodeRes,
+          qtypeRes,
+          latencyRes,
+          weeklyLatencyRes,
+        ] = await Promise.allSettled([
+          fetchQueryRecorderTimeseries(tag, { bucket, buckets, sinceMs }),
+          fetchQueryRecorderTopClients(tag, { limit: 6, sinceMs }),
+          fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs }),
+          fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs, status: "error" }),
+          fetchQueryRecords(tag, { limit: 12, sinceMs }),
+          fetchQueryRecorderRcodeDistribution(tag, { sinceMs }),
+          fetchQueryRecorderQtypeDistribution(tag, { sinceMs }),
+          fetchQueryRecorderLatency(tag, { sinceMs }),
+          fetchQueryRecorderLatency(tag, { sinceMs: startOfWeekMs }),
+        ]);
 
         let newRecorderLatency: QueryRecorderLatencySummary | null = null;
         if (latencyRes.status === "fulfilled" && latencyRes.value.ok) {
@@ -556,6 +591,14 @@ export function DnsOverview() {
           }));
         }
 
+        let newWeeklyQueries = 0;
+        if (weeklyLatencyRes.status === "fulfilled" && weeklyLatencyRes.value.ok) {
+          newWeeklyQueries = weeklyLatencyRes.value.sample_size || 0;
+        }
+        if (newWeeklyQueries > 0) {
+          setWeeklyTotalQueries(newWeeklyQueries);
+        }
+
         // Write to SWR cache
         dataCacheRef.current[targetRange] = {
           timeseriesData: newTimeseriesData,
@@ -566,6 +609,7 @@ export function DnsOverview() {
           rcodes: newRcodes,
           qtypes: newQtypes,
           recorderLatency: newRecorderLatency,
+          weeklyTotalQueries: newWeeklyQueries > 0 ? newWeeklyQueries : undefined,
           fetchedAt: Date.now(),
         };
 
@@ -608,6 +652,9 @@ export function DnsOverview() {
         setRcodes(cached.rcodes);
         setQtypes(cached.qtypes);
         setRecorderLatency(cached.recorderLatency);
+        if (cached.weeklyTotalQueries) {
+          setWeeklyTotalQueries(cached.weeklyTotalQueries);
+        }
         // Silently revalidate in background
         void loadRecorderData(newRange, true);
       } else {
@@ -662,6 +709,14 @@ export function DnsOverview() {
     }
     return windowTotalQueries;
   }, [trafficMetrics, windowTotalQueries]);
+
+  const displayedWeeklyTotal = useMemo(() => {
+    if (weeklyTotalQueries > 0) return weeklyTotalQueries;
+    if (trafficMetrics?.status === "available" && trafficMetrics.requestTotal > 0) {
+      return trafficMetrics.requestTotal;
+    }
+    return windowTotalQueries;
+  }, [weeklyTotalQueries, trafficMetrics, windowTotalQueries]);
 
   const currentQps = useMemo(() => {
     if (trafficMetrics?.qps !== null && trafficMetrics?.qps !== undefined) {
@@ -881,7 +936,7 @@ export function DnsOverview() {
           <div className="flex items-center justify-between mb-1.5 sm:mb-2">
             <span
               className="text-xs font-medium text-muted-foreground truncate"
-              title={`总解析请求（每周）\n总计累计: ${formatNumber(lifetimeTotalQueries)}`}
+              title={`总解析请求（每周总计，周一至周日为统计周期）\n每周总计: ${formatNumber(displayedWeeklyTotal)}\n历史开机总计: ${formatNumber(lifetimeTotalQueries)}`}
             >
               总解析请求（每周）
             </span>
@@ -889,15 +944,21 @@ export function DnsOverview() {
               <Calendar className="h-3 w-3 sm:h-3.5 sm:w-3.5 text-primary" />
             </div>
           </div>
-          <div suppressHydrationWarning className="text-xl sm:text-2xl font-bold tracking-tight tabular-nums text-foreground">
-            {formatNumber(windowTotalQueries > 0 ? windowTotalQueries : lifetimeTotalQueries)}
+          <div
+            suppressHydrationWarning
+            className="text-xl sm:text-2xl font-bold tracking-tight tabular-nums text-foreground"
+            title={`每周总计: ${formatNumber(displayedWeeklyTotal)} 次解析`}
+          >
+            {formatCompactCount(displayedWeeklyTotal)}
           </div>
           <div className="flex items-center gap-1 text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
             <TrendingUp className="h-3 w-3 text-primary shrink-0" />
-            <span className="truncate">
-              {windowTotalQueries > 0
-                ? `时段累计 (总计: ${formatNumber(lifetimeTotalQueries)})`
-                : "累计解析总量"}
+            <span className="truncate" title={`当前时段请求: ${formatNumber(windowTotalQueries)}`}>
+              {timeRange === "1h" ? "最近 1h: " : timeRange === "24h" ? "最近 24h: " : "实时: "}
+              <span className="font-semibold text-foreground">{formatCompactCount(windowTotalQueries)}</span>
+              {lifetimeTotalQueries > 0 && (
+                <span className="text-muted-foreground/70"> (总计: {formatCompactCount(lifetimeTotalQueries)})</span>
+              )}
             </span>
           </div>
         </div>
@@ -934,7 +995,7 @@ export function DnsOverview() {
             {blockRate}%
           </div>
           <div className="flex items-center justify-between text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
-            <span suppressHydrationWarning className="truncate">{formatNumber(blockCount)} 次拦截</span>
+            <span suppressHydrationWarning className="truncate" title={`${formatNumber(blockCount)} 次拦截`}>{formatCompactCount(blockCount)} 次拦截</span>
             <span className="text-[10px] font-mono text-muted-foreground shrink-0 hidden sm:inline">REFUSED / 阻断</span>
           </div>
         </div>
@@ -972,7 +1033,7 @@ export function DnsOverview() {
           </div>
           <div className="flex items-center justify-between text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
             <span suppressHydrationWarning className="truncate">
-              {cacheStats.hasCachePlugin ? `${formatNumber(cacheStats.hits)} 命中` : "未配置缓存插件"}
+              {cacheStats.hasCachePlugin ? `${formatCompactCount(cacheStats.hits)} 命中` : "未配置缓存插件"}
             </span>
             <span className="font-mono text-[10px] shrink-0">
               {cacheStats.hasCachePlugin ? "本地缓存" : "未启用"}
@@ -1070,7 +1131,7 @@ export function DnsOverview() {
                   className="text-[11px] text-muted-foreground"
                   tickLine={false}
                   axisLine={false}
-                  tickFormatter={(val) => (val >= 1000 ? `${(val / 1000).toFixed(1)}k` : String(val))}
+                  tickFormatter={(val) => (val >= 10000 ? `${(val / 10000).toFixed(1).replace(/\.0$/, "")}w` : val >= 1000 ? `${(val / 1000).toFixed(1)}k` : String(val))}
                 />
                 <Tooltip
                   content={({ active, payload, label }) => {
@@ -1393,8 +1454,8 @@ export function DnsOverview() {
                     <div className="flex items-center justify-between text-[11px] text-muted-foreground">
                       <span>
                         处理量:{" "}
-                        <span className="font-mono tabular-nums text-foreground">
-                          {formatNumber(ups.queries)}
+                        <span className="font-mono tabular-nums text-foreground" title={`${formatNumber(ups.queries)} 次请求`}>
+                          {formatCompactCount(ups.queries)}
                         </span>
                       </span>
                       <span>
@@ -1460,8 +1521,8 @@ export function DnsOverview() {
                   </div>
 
                   <div className="flex items-center gap-1.5 shrink-0">
-                    <span className="font-mono tabular-nums text-muted-foreground">
-                      {formatNumber(item.count)}
+                    <span className="font-mono tabular-nums text-muted-foreground" title={`${formatNumber(item.count)} 次`}>
+                      {formatCompactCount(item.count)}
                     </span>
                     <button
                       type="button"
@@ -1516,8 +1577,8 @@ export function DnsOverview() {
                   </div>
 
                   <div className="flex items-center gap-1.5 shrink-0">
-                    <span className="font-mono tabular-nums text-foreground/85 font-medium">
-                      {formatNumber(item.count)}
+                    <span className="font-mono tabular-nums text-foreground/85 font-medium" title={`${formatNumber(item.count)} 次`}>
+                      {formatCompactCount(item.count)}
                     </span>
                     <button
                       type="button"
