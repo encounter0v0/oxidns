@@ -17,6 +17,7 @@ import {
   Search,
   Server,
   ShieldAlert,
+  TrendingUp,
   Zap,
   Radio,
 } from "lucide-react";
@@ -48,77 +49,10 @@ import {
   type QueryRecordRow,
   type QueryRecorderLatencySummary,
 } from "@/lib/oxidns-api";
+import { GlassProgress } from "@/components/ui/glass-progress";
 
 // --- Types ---
 type TimeRange = "1h" | "24h" | "live";
-
-// Calculate timestamp of Monday 00:00:00.000 for current week
-function getMondayMidnight(now = new Date()): number {
-  const d = new Date(now);
-  const day = d.getDay(); // 0 is Sunday, 1 is Monday, ..., 6 is Saturday
-  const diffToMonday = day === 0 ? -6 : 1 - day;
-  d.setDate(d.getDate() + diffToMonday);
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
-}
-
-// Derive and persist weekly request count across Monday-Sunday cycle
-function getWeeklyRequestCount(rawTotal: number): number {
-  if (typeof window === "undefined") return rawTotal;
-  const currentWeekStart = getMondayMidnight();
-  const STORAGE_KEY = "oxidns_weekly_request_stats_v1";
-
-  let savedState: {
-    weekStartMs: number;
-    accumulated: number;
-    lastRaw: number;
-  } | null = null;
-
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) savedState = JSON.parse(raw);
-  } catch {
-    // ignore
-  }
-
-  if (!savedState || savedState.weekStartMs !== currentWeekStart) {
-    const isWeekAdvance = Boolean(savedState && savedState.weekStartMs < currentWeekStart);
-    const initialCount = isWeekAdvance ? 0 : rawTotal;
-    const newState = {
-      weekStartMs: currentWeekStart,
-      accumulated: initialCount,
-      lastRaw: rawTotal,
-    };
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(newState));
-    } catch {
-      // ignore
-    }
-    return initialCount;
-  }
-
-  let delta = rawTotal - savedState.lastRaw;
-  if (delta < 0) {
-    delta = rawTotal;
-  }
-
-  if (delta > 0 || rawTotal !== savedState.lastRaw) {
-    const nextCount = savedState.accumulated + Math.max(0, delta);
-    const updated = {
-      ...savedState,
-      accumulated: nextCount,
-      lastRaw: rawTotal,
-    };
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
-    } catch {
-      // ignore
-    }
-    return nextCount;
-  }
-
-  return savedState.accumulated;
-}
 
 interface TrafficPoint {
   time: string;
@@ -205,18 +139,6 @@ export function DnsOverview() {
   const [qtypes, setQtypes] = useState<QtypeDist[]>([]);
   const [recorderLatency, setRecorderLatency] = useState<QueryRecorderLatencySummary | null>(null);
   const [, setCopiedDomain] = useState<string | null>(null);
-
-  const weeklyRangeLabel = useMemo(() => {
-    const mon = new Date(getMondayMidnight());
-    const sun = new Date(mon.getTime() + 6 * 24 * 3600 * 1000);
-    const monStr = `${mon.getMonth() + 1}/${mon.getDate()}`;
-    const sunStr = `${sun.getMonth() + 1}/${sun.getDate()}`;
-    return `周一至周日 (${monStr} - ${sunStr})`;
-  }, []);
-
-  const weeklyQueries = useMemo(() => {
-    return getWeeklyRequestCount(trafficMetrics?.requestTotal ?? 0);
-  }, [trafficMetrics?.requestTotal]);
 
   // Query tester modal / dialog state
   const [testDomain, setTestDomain] = useState("");
@@ -774,12 +696,12 @@ export function DnsOverview() {
 
       {/* ── 6 Master Liquid Glass Metric Cards (Minimalist & High-Contrast) ── */}
       <div className="grid grid-cols-2 gap-2.5 sm:gap-3.5 sm:grid-cols-3 lg:grid-cols-6">
-        {/* Card 1: Total Queries (Weekly Cycle) */}
+        {/* Card 1: Total Queries (Weekly Header & Period Data) */}
         <div className="liquid-glass-card p-3 sm:p-4 relative overflow-hidden group">
           <div className="flex items-center justify-between mb-1.5 sm:mb-2">
             <span
               className="text-xs font-medium text-muted-foreground truncate"
-              title={`总解析请求（每周统计，下周一 00:00 自动重置）\n开机历史累计: ${formatNumber(lifetimeTotalQueries)}`}
+              title={`总解析请求（每周）\n总计累计: ${formatNumber(lifetimeTotalQueries)}`}
             >
               总解析请求（每周）
             </span>
@@ -788,17 +710,14 @@ export function DnsOverview() {
             </div>
           </div>
           <div suppressHydrationWarning className="text-xl sm:text-2xl font-bold tracking-tight tabular-nums text-foreground">
-            {formatNumber(weeklyQueries > 0 ? weeklyQueries : (trafficMetrics?.requestTotal ?? windowTotalQueries))}
+            {formatNumber(windowTotalQueries > 0 ? windowTotalQueries : lifetimeTotalQueries)}
           </div>
-          <div className="flex items-center justify-between text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5 truncate">
-            <span className="truncate" title={weeklyRangeLabel}>
-              {weeklyRangeLabel}
-            </span>
-            <span
-              className="text-[10px] font-mono text-muted-foreground shrink-0 hidden sm:inline"
-              title={`周一至周日为一个统计周期，下周一 00:00 自动开启新周期\n开机历史累计: ${formatNumber(lifetimeTotalQueries)}`}
-            >
-              周一重置
+          <div className="flex items-center gap-1 text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
+            <TrendingUp className="h-3 w-3 text-primary shrink-0" />
+            <span className="truncate">
+              {windowTotalQueries > 0
+                ? `时段累计 (总计: ${formatNumber(lifetimeTotalQueries)})`
+                : "累计解析总量"}
             </span>
           </div>
         </div>
@@ -1180,7 +1099,7 @@ export function DnsOverview() {
             {activeDistTab === "protocol" ? (
               <div className="space-y-3 pt-1">
                 {configuredProtocols.length > 0 ? (
-                  configuredProtocols.map((p, idx) => (
+                  configuredProtocols.map((p) => (
                     <div key={p.name} className="space-y-1">
                       <div className="flex items-center justify-between text-xs">
                         <span className="font-medium flex items-center gap-1.5 text-foreground">
@@ -1191,23 +1110,7 @@ export function DnsOverview() {
                           {formatNumber(p.value)} ({p.pct}%)
                         </span>
                       </div>
-                      <div className="liquid-glass-progress-track h-2">
-                        <div
-                          className={cn(
-                            "liquid-glass-progress-bar",
-                            idx === 0
-                              ? "neon-glow-cyan"
-                              : idx === 1
-                              ? "neon-glow-violet"
-                              : idx === 2
-                              ? "neon-glow-emerald"
-                              : "neon-glow-amber",
-                          )}
-                          style={{
-                            width: `${Math.min(100, Math.max(0, p.pct))}%`,
-                          }}
-                        />
-                      </div>
+                      <GlassProgress value={p.pct} className="h-2" />
                     </div>
                   ))
                 ) : (
@@ -1220,7 +1123,7 @@ export function DnsOverview() {
             ) : (
               <div className="space-y-3 pt-1">
                 {qtypes.length > 0 ? (
-                  qtypes.map((q, idx) => (
+                  qtypes.map((q) => (
                     <div key={q.name} className="space-y-1">
                       <div className="flex items-center justify-between text-xs">
                         <span className="font-medium flex items-center gap-1.5 text-foreground">
@@ -1231,25 +1134,7 @@ export function DnsOverview() {
                           {formatNumber(q.value)} ({q.pct}%)
                         </span>
                       </div>
-                      <div className="liquid-glass-progress-track h-2">
-                        <div
-                          className={cn(
-                            "liquid-glass-progress-bar",
-                            idx === 0
-                              ? "neon-glow-cyan"
-                              : idx === 1
-                              ? "neon-glow-emerald"
-                              : idx === 2
-                              ? "neon-glow-violet"
-                              : idx === 3
-                              ? "neon-glow-amber"
-                              : "neon-glow-rose",
-                          )}
-                          style={{
-                            width: `${Math.min(100, Math.max(0, q.pct))}%`,
-                          }}
-                        />
-                      </div>
+                      <GlassProgress value={q.pct} className="h-2" />
                     </div>
                   ))
                 ) : (
@@ -1289,16 +1174,6 @@ export function DnsOverview() {
             {configuredUpstreams.map((ups) => {
               const successPct =
                 ups.queries > 0 ? Math.min(100, Math.max(0, ups.successRate)) : 0;
-              const neonClass =
-                ups.queries === 0
-                  ? "neon-glow-cyan opacity-25"
-                  : ups.successRate >= 80
-                  ? "neon-glow-emerald"
-                  : ups.successRate >= 40
-                  ? "neon-glow-cyan"
-                  : ups.successRate >= 20
-                  ? "neon-glow-amber"
-                  : "neon-glow-rose";
 
               return (
                 <div
@@ -1336,32 +1211,12 @@ export function DnsOverview() {
                       </span>
                       <span>
                         成功率:{" "}
-                        <span
-                          className={cn(
-                            "font-mono tabular-nums font-medium",
-                            ups.queries === 0
-                              ? "text-muted-foreground"
-                              : ups.successRate >= 80
-                              ? "text-emerald-500 dark:text-emerald-400"
-                              : ups.successRate >= 40
-                              ? "text-cyan-500 dark:text-cyan-400"
-                              : ups.successRate >= 20
-                              ? "text-amber-500 dark:text-amber-400"
-                              : "text-rose-500 dark:text-rose-400",
-                          )}
-                        >
+                        <span className="font-mono tabular-nums font-medium text-foreground">
                           {ups.queries > 0 ? `${ups.successRate}%` : "-"}
                         </span>
                       </span>
                     </div>
-                    <div className="liquid-glass-progress-track h-2">
-                      <div
-                        className={cn("liquid-glass-progress-bar", neonClass)}
-                        style={{
-                          width: `${successPct}%`,
-                        }}
-                      />
-                    </div>
+                    <GlassProgress value={successPct} className="h-2" />
                   </div>
                 </div>
               );
@@ -1507,7 +1362,7 @@ export function DnsOverview() {
 
           <div className="space-y-3">
             {topClients.length > 0 ? (
-              topClients.map((item, idx) => (
+              topClients.map((item) => (
                 <div key={item.ip || item.name} className="space-y-1">
                   <div className="flex items-center justify-between text-xs">
                     <div className="flex items-center gap-1.5 min-w-0">
@@ -1517,21 +1372,7 @@ export function DnsOverview() {
                       {item.percentage}%
                     </span>
                   </div>
-                  <div className="liquid-glass-progress-track h-2">
-                    <div
-                      className={cn(
-                        "liquid-glass-progress-bar",
-                        idx === 0
-                          ? "neon-glow-cyan"
-                          : idx === 1
-                          ? "neon-glow-emerald"
-                          : idx === 2
-                          ? "neon-glow-violet"
-                          : "neon-glow-amber",
-                      )}
-                      style={{ width: `${Math.min(100, Math.max(0, item.percentage))}%` }}
-                    />
-                  </div>
+                  <GlassProgress value={item.percentage} className="h-2" />
                 </div>
               ))
             ) : (
