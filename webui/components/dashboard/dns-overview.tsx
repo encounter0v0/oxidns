@@ -151,6 +151,7 @@ interface RangeCacheData {
   qtypes: QtypeDist[];
   recorderLatency: QueryRecorderLatencySummary | null;
   weeklyTotalQueries?: number;
+  dbTotalRecords?: number;
   fetchedAt: number;
 }
 
@@ -267,6 +268,7 @@ export function DnsOverview() {
   const [qtypes, setQtypes] = useState<QtypeDist[]>([]);
   const [recorderLatency, setRecorderLatency] = useState<QueryRecorderLatencySummary | null>(null);
   const [weeklyTotalQueries, setWeeklyTotalQueries] = useState<number>(0);
+  const [dbTotalRecords, setDbTotalRecords] = useState<number>(0);
   const [, setCopiedDomain] = useState<string | null>(null);
 
   // Query tester modal / dialog state
@@ -449,6 +451,7 @@ export function DnsOverview() {
           qtypeRes,
           latencyRes,
           weeklyLatencyRes,
+          latestRecordRes,
         ] = await Promise.allSettled([
           fetchQueryRecorderTimeseries(tag, { bucket, buckets, sinceMs }),
           fetchQueryRecorderTopClients(tag, { limit: 6, sinceMs }),
@@ -459,6 +462,7 @@ export function DnsOverview() {
           fetchQueryRecorderQtypeDistribution(tag, { sinceMs }),
           fetchQueryRecorderLatency(tag, { sinceMs }),
           fetchQueryRecorderLatency(tag, { sinceMs: startOfWeekMs }),
+          fetchQueryRecords(tag, { limit: 1 }),
         ]);
 
         let newRecorderLatency: QueryRecorderLatencySummary | null = null;
@@ -599,6 +603,18 @@ export function DnsOverview() {
           setWeeklyTotalQueries(newWeeklyQueries);
         }
 
+        let newDbTotal = 0;
+        if (
+          latestRecordRes.status === "fulfilled" &&
+          latestRecordRes.value.ok &&
+          latestRecordRes.value.records?.length > 0
+        ) {
+          newDbTotal = latestRecordRes.value.records[0].id || 0;
+        }
+        if (newDbTotal > 0) {
+          setDbTotalRecords(newDbTotal);
+        }
+
         // Write to SWR cache
         dataCacheRef.current[targetRange] = {
           timeseriesData: newTimeseriesData,
@@ -610,6 +626,7 @@ export function DnsOverview() {
           qtypes: newQtypes,
           recorderLatency: newRecorderLatency,
           weeklyTotalQueries: newWeeklyQueries > 0 ? newWeeklyQueries : undefined,
+          dbTotalRecords: newDbTotal > 0 ? newDbTotal : undefined,
           fetchedAt: Date.now(),
         };
 
@@ -654,6 +671,9 @@ export function DnsOverview() {
         setRecorderLatency(cached.recorderLatency);
         if (cached.weeklyTotalQueries) {
           setWeeklyTotalQueries(cached.weeklyTotalQueries);
+        }
+        if (cached.dbTotalRecords) {
+          setDbTotalRecords(cached.dbTotalRecords);
         }
         // Silently revalidate in background
         void loadRecorderData(newRange, true);
@@ -704,19 +724,21 @@ export function DnsOverview() {
   }, [timeseriesData]);
 
   const lifetimeTotalQueries = useMemo(() => {
+    if (dbTotalRecords > 0) return dbTotalRecords;
     if (trafficMetrics?.status === "available" && trafficMetrics.requestTotal > 0) {
       return trafficMetrics.requestTotal;
     }
     return windowTotalQueries;
-  }, [trafficMetrics, windowTotalQueries]);
+  }, [dbTotalRecords, trafficMetrics, windowTotalQueries]);
 
   const displayedWeeklyTotal = useMemo(() => {
     if (weeklyTotalQueries > 0) return weeklyTotalQueries;
+    if (dbTotalRecords > 0) return dbTotalRecords;
     if (trafficMetrics?.status === "available" && trafficMetrics.requestTotal > 0) {
       return trafficMetrics.requestTotal;
     }
     return windowTotalQueries;
-  }, [weeklyTotalQueries, trafficMetrics, windowTotalQueries]);
+  }, [weeklyTotalQueries, dbTotalRecords, trafficMetrics, windowTotalQueries]);
 
   const currentQps = useMemo(() => {
     if (trafficMetrics?.qps !== null && trafficMetrics?.qps !== undefined) {
