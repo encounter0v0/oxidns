@@ -152,6 +152,7 @@ interface RangeCacheData {
   recorderLatency: QueryRecorderLatencySummary | null;
   weeklyTotalQueries?: number;
   dbTotalRecords?: number;
+  periodTotalQueries?: number;
   fetchedAt: number;
 }
 
@@ -269,6 +270,7 @@ export function DnsOverview() {
   const [recorderLatency, setRecorderLatency] = useState<QueryRecorderLatencySummary | null>(null);
   const [weeklyTotalQueries, setWeeklyTotalQueries] = useState<number>(0);
   const [dbTotalRecords, setDbTotalRecords] = useState<number>(0);
+  const [periodTotalQueries, setPeriodTotalQueries] = useState<number>(0);
   const [, setCopiedDomain] = useState<string | null>(null);
 
   // Query tester modal / dialog state
@@ -421,26 +423,31 @@ export function DnsOverview() {
         const tag = recorderPlugin.name || recorderPlugin.id;
 
         const now = Date.now();
+        const startOfWeekMs = getStartOfWeekMs(now);
+
         let sinceMs: number | undefined;
         let bucket: "minute" | "hour" = "minute";
         let buckets = 60;
+        let rangeSinceMs = Math.max(now - 60 * 60 * 1000, startOfWeekMs);
 
         if (targetRange === "1h") {
-          sinceMs = now - 60 * 60 * 1000;
+          rangeSinceMs = Math.max(now - 60 * 60 * 1000, startOfWeekMs);
+          sinceMs = rangeSinceMs;
           bucket = "minute";
           buckets = 60;
         } else if (targetRange === "24h") {
-          sinceMs = now - 24 * 60 * 60 * 1000;
+          rangeSinceMs = Math.max(now - 24 * 60 * 60 * 1000, startOfWeekMs);
+          sinceMs = rangeSinceMs;
           bucket = "hour";
           buckets = 24;
         } else {
-          // live (15 min)
-          sinceMs = now - 15 * 60 * 1000;
+          // live: 5s window for card metric, 15m window for chart
+          rangeSinceMs = Math.max(now - 5 * 1000, startOfWeekMs);
+          sinceMs = Math.max(now - 15 * 60 * 1000, startOfWeekMs);
           bucket = "minute";
           buckets = 15;
         }
 
-        const startOfWeekMs = getStartOfWeekMs(now);
         const [
           tsRes,
           clientsRes,
@@ -450,8 +457,9 @@ export function DnsOverview() {
           rcodeRes,
           qtypeRes,
           latencyRes,
-          weeklyLatencyRes,
           latestRecordRes,
+          beforeWeekRecordRes,
+          beforeRangeRecordRes,
         ] = await Promise.allSettled([
           fetchQueryRecorderTimeseries(tag, { bucket, buckets, sinceMs }),
           fetchQueryRecorderTopClients(tag, { limit: 6, sinceMs }),
@@ -461,8 +469,9 @@ export function DnsOverview() {
           fetchQueryRecorderRcodeDistribution(tag, { sinceMs }),
           fetchQueryRecorderQtypeDistribution(tag, { sinceMs }),
           fetchQueryRecorderLatency(tag, { sinceMs }),
-          fetchQueryRecorderLatency(tag, { sinceMs: startOfWeekMs }),
           fetchQueryRecords(tag, { limit: 1 }),
+          fetchQueryRecords(tag, { limit: 1, untilMs: startOfWeekMs - 1 }),
+          fetchQueryRecords(tag, { limit: 1, untilMs: rangeSinceMs - 1 }),
         ]);
 
         let newRecorderLatency: QueryRecorderLatencySummary | null = null;
@@ -595,25 +604,43 @@ export function DnsOverview() {
           }));
         }
 
-        let newWeeklyQueries = 0;
-        if (weeklyLatencyRes.status === "fulfilled" && weeklyLatencyRes.value.ok) {
-          newWeeklyQueries = weeklyLatencyRes.value.sample_size || 0;
-        }
-        if (newWeeklyQueries > 0) {
-          setWeeklyTotalQueries(newWeeklyQueries);
+        const latestId =
+          (latestRecordRes.status === "fulfilled" &&
+            latestRecordRes.value.ok &&
+            latestRecordRes.value.records?.[0]?.id) ||
+          0;
+
+        const beforeWeekId =
+          (beforeWeekRecordRes.status === "fulfilled" &&
+            beforeWeekRecordRes.value.ok &&
+            beforeWeekRecordRes.value.records?.[0]?.id) ||
+          0;
+
+        const beforeRangeId =
+          (beforeRangeRecordRes.status === "fulfilled" &&
+            beforeRangeRecordRes.value.ok &&
+            beforeRangeRecordRes.value.records?.[0]?.id) ||
+          beforeWeekId;
+
+        if (latestId > 0) {
+          setDbTotalRecords(latestId);
         }
 
-        let newDbTotal = 0;
-        if (
-          latestRecordRes.status === "fulfilled" &&
-          latestRecordRes.value.ok &&
-          latestRecordRes.value.records?.length > 0
-        ) {
-          newDbTotal = latestRecordRes.value.records[0].id || 0;
+        let calculatedWeeklyTotal = 0;
+        if (latestId > 0) {
+          calculatedWeeklyTotal = Math.max(0, latestId - beforeWeekId);
         }
-        if (newDbTotal > 0) {
-          setDbTotalRecords(newDbTotal);
+        if (calculatedWeeklyTotal > 0) {
+          setWeeklyTotalQueries(calculatedWeeklyTotal);
         }
+
+        let calculatedPeriodCount = 0;
+        if (latestId > 0) {
+          calculatedPeriodCount = Math.max(0, latestId - beforeRangeId);
+        } else {
+          calculatedPeriodCount = newTimeseriesData.reduce((acc, c) => acc + c.total, 0);
+        }
+        setPeriodTotalQueries(calculatedPeriodCount);
 
         // Write to SWR cache
         dataCacheRef.current[targetRange] = {
@@ -625,8 +652,9 @@ export function DnsOverview() {
           rcodes: newRcodes,
           qtypes: newQtypes,
           recorderLatency: newRecorderLatency,
-          weeklyTotalQueries: newWeeklyQueries > 0 ? newWeeklyQueries : undefined,
-          dbTotalRecords: newDbTotal > 0 ? newDbTotal : undefined,
+          weeklyTotalQueries: calculatedWeeklyTotal > 0 ? calculatedWeeklyTotal : undefined,
+          periodTotalQueries: calculatedPeriodCount,
+          dbTotalRecords: latestId > 0 ? latestId : undefined,
           fetchedAt: Date.now(),
         };
 
@@ -674,6 +702,9 @@ export function DnsOverview() {
         }
         if (cached.dbTotalRecords) {
           setDbTotalRecords(cached.dbTotalRecords);
+        }
+        if (cached.periodTotalQueries !== undefined) {
+          setPeriodTotalQueries(cached.periodTotalQueries);
         }
         // Silently revalidate in background
         void loadRecorderData(newRange, true);
@@ -739,6 +770,11 @@ export function DnsOverview() {
     }
     return windowTotalQueries;
   }, [weeklyTotalQueries, dbTotalRecords, trafficMetrics, windowTotalQueries]);
+
+  const displayedPeriodTotal = useMemo(() => {
+    if (periodTotalQueries > 0) return periodTotalQueries;
+    return windowTotalQueries;
+  }, [periodTotalQueries, windowTotalQueries]);
 
   const currentQps = useMemo(() => {
     if (trafficMetrics?.qps !== null && trafficMetrics?.qps !== undefined) {
@@ -975,12 +1011,11 @@ export function DnsOverview() {
           </div>
           <div className="flex items-center gap-1 text-[10px] sm:text-[11px] text-muted-foreground mt-1 sm:mt-1.5">
             <TrendingUp className="h-3 w-3 text-primary shrink-0" />
-            <span className="truncate" title={`当前时段请求: ${formatNumber(windowTotalQueries)}`}>
-              {timeRange === "1h" ? "最近 1h: " : timeRange === "24h" ? "最近 24h: " : "实时: "}
-              <span className="font-semibold text-foreground">{formatCompactCount(windowTotalQueries)}</span>
-              {lifetimeTotalQueries > 0 && (
-                <span className="text-muted-foreground/70"> (总计: {formatCompactCount(lifetimeTotalQueries)})</span>
-              )}
+            <span className="truncate" title={`当前时段请求: ${formatNumber(displayedPeriodTotal)}`}>
+              {timeRange === "1h" && "最近 1h: "}
+              {timeRange === "24h" && "最近 24h: "}
+              {timeRange === "live" && "实时 (5s): "}
+              <span className="font-semibold text-foreground">{formatCompactCount(displayedPeriodTotal)}</span>
             </span>
           </div>
         </div>
