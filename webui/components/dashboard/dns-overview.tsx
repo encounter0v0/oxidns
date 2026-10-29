@@ -24,6 +24,9 @@ import {
 import {
   AreaChart,
   Area,
+  PieChart,
+  Pie,
+  Cell,
   XAxis,
   YAxis,
   Tooltip,
@@ -48,7 +51,6 @@ import {
   type QueryRecorderTimeseriesPoint,
 } from "@/lib/oxidns-api";
 import { GlassProgress } from "@/components/ui/glass-progress";
-import { GlassGauge } from "@/components/ui/glass-gauge";
 
 // --- Types ---
 type TimeRange = "1h" | "24h" | "live";
@@ -1286,7 +1288,7 @@ export function DnsOverview() {
 
       {/* ── Chart Section 2: Distribution Row (2 Columns) ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-        {/* Left: DNS Response Codes (RCODE) Liquid Glass Gauge */}
+        {/* Left: DNS Response Codes (RCODE) Liquid Glass Multi-Segment Donut */}
         <div className="liquid-glass-card p-5 flex flex-col justify-between">
           <div>
             {(() => {
@@ -1313,26 +1315,88 @@ export function DnsOverview() {
                   {rcodes.length > 0 ? (
                     <div className="grid grid-cols-1 sm:grid-cols-2 items-center gap-5">
                       <div className="h-48 relative flex items-center justify-center">
-                        <GlassGauge
-                          value={normalRate}
-                          colorScheme="gradient"
-                          size={168}
-                          strokeWidth={14}
-                          label="正常率"
-                          showGlow={true}
-                        />
+                        {/* Ambient Neon Atmosphere Glow */}
+                        <div className="absolute inset-4 rounded-full bg-gradient-to-tr from-cyan-500/20 via-blue-500/20 to-purple-500/20 blur-xl opacity-40 pointer-events-none" />
+
+                        <ResponsiveContainer width="100%" height="100%">
+                          <PieChart>
+                            <defs>
+                              <linearGradient id="rcode-glass-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" stopColor="#22d3ee" />
+                                <stop offset="50%" stopColor="#60a5fa" />
+                                <stop offset="100%" stopColor="#c084fc" />
+                              </linearGradient>
+                            </defs>
+                            <Pie
+                              data={rcodes}
+                              cx="50%"
+                              cy="50%"
+                              innerRadius={58}
+                              outerRadius={80}
+                              paddingAngle={3}
+                              dataKey="value"
+                              stroke="none"
+                              isAnimationActive={false}
+                            >
+                              {rcodes.map((entry, index) => {
+                                const isNoError =
+                                  entry.name.toUpperCase().includes("NOERROR") ||
+                                  entry.name.toUpperCase().includes("NO ERROR") ||
+                                  entry.name.toUpperCase() === "SUCCESS";
+                                return (
+                                  <Cell
+                                    key={`cell-${index}`}
+                                    fill={isNoError ? "url(#rcode-glass-gradient)" : entry.color}
+                                    className="transition-all duration-300"
+                                  />
+                                );
+                              })}
+                            </Pie>
+                            <Tooltip
+                              content={({ active, payload }) => {
+                                if (!active || !payload?.length) return null;
+                                const data = payload[0].payload as RcodeDist;
+                                return (
+                                  <div className="liquid-glass-card p-2 text-xs shadow-md border border-border/50">
+                                    <span className="font-semibold text-foreground">{data.name}</span>:{" "}
+                                    {formatNumber(data.value)} ({data.pct}%)
+                                  </div>
+                                );
+                              }}
+                            />
+                          </PieChart>
+                        </ResponsiveContainer>
+
+                        {/* Center Frosted Glass Lens */}
+                        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+                          <div className="w-[104px] h-[104px] rounded-full bg-white/40 dark:bg-white/[0.04] backdrop-blur-md border border-white/40 dark:border-white/10 shadow-[inset_0_1px_2px_rgba(255,255,255,0.4),0_4px_16px_rgba(0,0,0,0.04)] flex flex-col items-center justify-center">
+                            <span className="text-2xl font-bold font-mono tracking-tight text-foreground drop-shadow-sm">
+                              {normalRate}%
+                            </span>
+                            <span className="text-[11px] font-medium text-muted-foreground mt-0.5">正常率</span>
+                          </div>
+                        </div>
                       </div>
 
-                      {/* Legend List with unified GlassProgress bars */}
+                      {/* Legend List */}
                       <div className="space-y-3">
-                        {rcodes.map((rc) => (
-                          <div key={rc.name} className="space-y-1">
-                            <div className="flex items-center justify-between text-xs">
-                              <div className="flex items-center gap-2 min-w-0">
-                                <span
-                                  className="h-2 w-2 rounded-full shrink-0 shadow-[0_0_6px_currentColor]"
-                                  style={{ backgroundColor: rc.color, color: rc.color }}
-                                />
+                        {rcodes.map((rc) => {
+                          const isNoError =
+                            rc.name.toUpperCase().includes("NOERROR") ||
+                            rc.name.toUpperCase().includes("NO ERROR") ||
+                            rc.name.toUpperCase() === "SUCCESS";
+
+                          return (
+                            <div key={rc.name} className="flex items-center justify-between text-xs">
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                {isNoError ? (
+                                  <span className="h-2.5 w-2.5 rounded-full shrink-0 bg-gradient-to-r from-cyan-400 via-blue-400 to-purple-400 shadow-[0_0_8px_rgba(59,130,246,0.5)]" />
+                                ) : (
+                                  <span
+                                    className="h-2.5 w-2.5 rounded-full shrink-0 shadow-[0_0_6px_currentColor]"
+                                    style={{ backgroundColor: rc.color, color: rc.color }}
+                                  />
+                                )}
                                 <span className="truncate font-medium text-foreground/90">{rc.name}</span>
                               </div>
                               <div className="flex items-center gap-2 font-mono tabular-nums">
@@ -1340,9 +1404,8 @@ export function DnsOverview() {
                                 <span className="font-semibold text-foreground min-w-[38px] text-right">{rc.pct}%</span>
                               </div>
                             </div>
-                            <GlassProgress value={rc.pct} className="h-1.5" />
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     </div>
                   ) : (
