@@ -24,9 +24,6 @@ import {
 import {
   AreaChart,
   Area,
-  PieChart,
-  Pie,
-  Cell,
   XAxis,
   YAxis,
   Tooltip,
@@ -51,6 +48,7 @@ import {
   type QueryRecorderTimeseriesPoint,
 } from "@/lib/oxidns-api";
 import { GlassProgress } from "@/components/ui/glass-progress";
+import { GlassGauge } from "@/components/ui/glass-gauge";
 
 // --- Types ---
 type TimeRange = "1h" | "24h" | "live";
@@ -580,17 +578,22 @@ export function DnsOverview() {
         let newRcodes: RcodeDist[] = [];
         if (rcodeRes.status === "fulfilled" && rcodeRes.value.ok && rcodeRes.value.rows?.length > 0) {
           const rcodeColors: Record<string, string> = {
-            NOERROR: "#10b981",
+            NOERROR: "#22d3ee",
+            "NO ERROR": "#22d3ee",
             NXDOMAIN: "#64748b",
+            "NON-EXISTENT DOMAIN": "#64748b",
             REFUSED: "#f43f5e",
             SERVFAIL: "#f59e0b",
           };
-          newRcodes = rcodeRes.value.rows.map((row) => ({
-            name: row.key,
-            value: row.count,
-            pct: Number((row.share * 100).toFixed(1)),
-            color: rcodeColors[row.key] || "#94a3b8",
-          }));
+          newRcodes = rcodeRes.value.rows.map((row) => {
+            const keyUpper = (row.key || "").trim().toUpperCase();
+            return {
+              name: row.key,
+              value: row.count,
+              pct: Number((row.share * 100).toFixed(1)),
+              color: rcodeColors[keyUpper] || rcodeColors[row.key] || "#94a3b8",
+            };
+          });
         }
 
         let newQtypes: QtypeDist[] = [];
@@ -1283,87 +1286,77 @@ export function DnsOverview() {
 
       {/* ── Chart Section 2: Distribution Row (2 Columns) ── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-        {/* Left: DNS Response Codes (RCODE) Donut */}
+        {/* Left: DNS Response Codes (RCODE) Liquid Glass Gauge */}
         <div className="liquid-glass-card p-5 flex flex-col justify-between">
           <div>
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-2">
-                <PieChartIcon className="h-4 w-4 text-primary" />
-                <h3 className="text-sm font-semibold text-foreground">DNS 解析状态分布 (RCODE)</h3>
-              </div>
-              {rcodes.length > 0 && (
-                <span className="liquid-glass-pill bg-foreground/[0.04] text-muted-foreground text-[11px] border border-foreground/[0.08]">
-                  {rcodes.find((r) => r.name.includes("NOERROR"))?.pct ?? 100}% 正常服务率
-                </span>
-              )}
-            </div>
+            {(() => {
+              const noErrorItem = rcodes.find((r) => {
+                const n = (r.name || "").toUpperCase();
+                return n.includes("NOERROR") || n.includes("NO ERROR") || n === "SUCCESS";
+              });
+              const normalRate = noErrorItem ? noErrorItem.pct : 100;
 
-            {rcodes.length > 0 ? (
-              <div className="grid grid-cols-1 sm:grid-cols-2 items-center gap-4">
-                <div className="h-48 relative flex items-center justify-center">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <PieChart>
-                      <Pie
-                        data={rcodes}
-                        cx="50%"
-                        cy="50%"
-                        innerRadius={58}
-                        outerRadius={80}
-                        paddingAngle={3}
-                        dataKey="value"
-                      >
-                        {rcodes.map((entry, index) => (
-                          <Cell key={`cell-${index}`} fill={entry.color} />
-                        ))}
-                      </Pie>
-                      <Tooltip
-                        content={({ active, payload }) => {
-                          if (!active || !payload?.length) return null;
-                          const data = payload[0].payload as RcodeDist;
-                          return (
-                            <div className="liquid-glass-card p-2 text-xs shadow-md border border-border/50">
-                              <span className="font-semibold text-foreground">{data.name}</span>:{" "}
-                              {formatNumber(data.value)} ({data.pct}%)
-                            </div>
-                          );
-                        }}
-                      />
-                    </PieChart>
-                  </ResponsiveContainer>
-                  {/* Center Badge */}
-                  <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-                    <span className="text-xl font-bold font-mono text-foreground">
-                      {rcodes.find((r) => r.name.includes("NOERROR"))?.pct ?? 100}%
-                    </span>
-                    <span className="text-[10px] text-muted-foreground">正常率</span>
+              return (
+                <>
+                  <div className="flex items-center justify-between mb-4">
+                    <div className="flex items-center gap-2">
+                      <PieChartIcon className="h-4 w-4 text-primary" />
+                      <h3 className="text-sm font-semibold text-foreground">DNS 解析状态分布 (RCODE)</h3>
+                    </div>
+                    {rcodes.length > 0 && (
+                      <span className="liquid-glass-pill bg-foreground/[0.04] text-muted-foreground text-[11px] border border-foreground/[0.08]">
+                        {normalRate}% 正常服务率
+                      </span>
+                    )}
                   </div>
-                </div>
 
-                {/* Legend List */}
-                <div className="space-y-2.5">
-                  {rcodes.map((rc) => (
-                    <div key={rc.name} className="flex items-center justify-between text-xs">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="h-2 w-2 rounded-full shrink-0" style={{ backgroundColor: rc.color }} />
-                        <span className="truncate text-foreground/90">{rc.name}</span>
+                  {rcodes.length > 0 ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 items-center gap-5">
+                      <div className="h-48 relative flex items-center justify-center">
+                        <GlassGauge
+                          value={normalRate}
+                          colorScheme="gradient"
+                          size={168}
+                          strokeWidth={14}
+                          label="正常率"
+                          showGlow={true}
+                        />
                       </div>
-                      <div className="flex items-center gap-2 font-mono tabular-nums">
-                        <span className="text-muted-foreground">{formatNumber(rc.value)}</span>
-                        <span className="font-medium text-foreground min-w-[38px] text-right">{rc.pct}%</span>
+
+                      {/* Legend List with unified GlassProgress bars */}
+                      <div className="space-y-3">
+                        {rcodes.map((rc) => (
+                          <div key={rc.name} className="space-y-1">
+                            <div className="flex items-center justify-between text-xs">
+                              <div className="flex items-center gap-2 min-w-0">
+                                <span
+                                  className="h-2 w-2 rounded-full shrink-0 shadow-[0_0_6px_currentColor]"
+                                  style={{ backgroundColor: rc.color, color: rc.color }}
+                                />
+                                <span className="truncate font-medium text-foreground/90">{rc.name}</span>
+                              </div>
+                              <div className="flex items-center gap-2 font-mono tabular-nums">
+                                <span className="text-muted-foreground">{formatNumber(rc.value)}</span>
+                                <span className="font-semibold text-foreground min-w-[38px] text-right">{rc.pct}%</span>
+                              </div>
+                            </div>
+                            <GlassProgress value={rc.pct} className="h-1.5" />
+                          </div>
+                        ))}
                       </div>
                     </div>
-                  ))}
-                </div>
-              </div>
-            ) : (
-              <div className="h-48 flex flex-col items-center justify-center text-center p-4 text-xs text-muted-foreground">
-                <PieChartIcon className="h-8 w-8 text-muted-foreground/30 mb-2" />
-                <span>暂无 RCODE 状态分布数据</span>
-                <span className="text-[11px] text-muted-foreground/60 mt-0.5">
-                  在主流程中启用 query_recorder 插件后可自动收集
-                </span>
-              </div>
-            )}
+                  ) : (
+                    <div className="h-48 flex flex-col items-center justify-center text-center p-4 text-xs text-muted-foreground">
+                      <PieChartIcon className="h-8 w-8 text-muted-foreground/30 mb-2" />
+                      <span>暂无 RCODE 状态分布数据</span>
+                      <span className="text-[11px] text-muted-foreground/60 mt-0.5">
+                        在主流程中启用 query_recorder 插件后可自动收集
+                      </span>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
           </div>
         </div>
 
