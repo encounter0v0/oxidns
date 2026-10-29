@@ -1,3 +1,19 @@
+# OxiDNS v1.6.13
+## 🚀 发布概览
+**左侧圆环升级为 GlassGauge**
+-<GlassGauge
+  value={normalRate}
+  colorScheme="gradient"
+  size={168}
+  strokeWidth={14}
+  label="正常率"
+  showGlow={true}
+/>
+
+
+
+
+
 # OxiDNS v1.6.8
 
 ## 🚀 发布概览
