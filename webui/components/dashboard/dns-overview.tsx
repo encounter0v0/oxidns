@@ -420,12 +420,12 @@ export function DnsOverview() {
       }
 
       if (inFlightRef.current[targetRange]) {
-        if (!isSilent && targetRange === timeRangeRef.current) {
-          setIsRefreshing(true);
-        }
         return;
       }
       inFlightRef.current[targetRange] = true;
+
+      const abortController = new AbortController();
+      const abortTimeout = setTimeout(() => abortController.abort(), 6000);
 
       try {
         if (!isSilent) {
@@ -472,19 +472,19 @@ export function DnsOverview() {
           beforeWeekRecordRes,
           beforeRangeRecordRes,
         ] = await Promise.allSettled([
-          fetchQueryRecorderTimeseries(tag, { bucket, buckets, sinceMs }),
-          fetchQueryRecorderTopClients(tag, { limit: 6, sinceMs }),
-          fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs }),
-          fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs, status: "error" }),
-          fetchQueryRecords(tag, { limit: 12, sinceMs }),
-          fetchQueryRecorderRcodeDistribution(tag, { sinceMs }),
-          fetchQueryRecorderQtypeDistribution(tag, { sinceMs }),
-          fetchQueryRecorderLatency(tag, { sinceMs }),
-          fetchQueryRecords(tag, { limit: 1 }),
+          fetchQueryRecorderTimeseries(tag, { bucket, buckets, sinceMs, signal: abortController.signal }),
+          fetchQueryRecorderTopClients(tag, { limit: 6, sinceMs, signal: abortController.signal }),
+          fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs, signal: abortController.signal }),
+          fetchQueryRecorderTopQnames(tag, { limit: 7, sinceMs, status: "error", signal: abortController.signal }),
+          fetchQueryRecords(tag, { limit: 12, sinceMs, signal: abortController.signal }),
+          fetchQueryRecorderRcodeDistribution(tag, { sinceMs, signal: abortController.signal }),
+          fetchQueryRecorderQtypeDistribution(tag, { sinceMs, signal: abortController.signal }),
+          fetchQueryRecorderLatency(tag, { sinceMs, signal: abortController.signal }),
+          fetchQueryRecords(tag, { limit: 1, signal: abortController.signal }),
           beforeWeekIdCacheRef.current !== null
             ? Promise.resolve({ ok: true, records: [{ id: beforeWeekIdCacheRef.current }] as unknown as QueryRecordRow[] })
-            : fetchQueryRecords(tag, { limit: 1, untilMs: startOfWeekMs - 1 }),
-          fetchQueryRecords(tag, { limit: 1, untilMs: rangeSinceMs - 1 }),
+            : fetchQueryRecords(tag, { limit: 1, untilMs: startOfWeekMs - 1, signal: abortController.signal }),
+          fetchQueryRecords(tag, { limit: 1, untilMs: rangeSinceMs - 1, signal: abortController.signal }),
         ]);
 
         let newRecorderLatency: QueryRecorderLatencySummary | null = null;
@@ -492,45 +492,128 @@ export function DnsOverview() {
           newRecorderLatency = latencyRes.value;
         }
 
-        let newTimeseriesData: TrafficPoint[] = [];
-        if (tsRes.status === "fulfilled" && tsRes.value.ok) {
-          const rawPoints = [...(tsRes.value.points || [])];
-          // Pure frontend uncapped backfill: If database 1w sample limit caused earlier gap,
-          // fetch prior batches via untilMs until the entire requested range is filled
-          const minRequiredMs = sinceMs ?? rangeSinceMs;
-          const stepMs = targetRange === "24h" ? 3600 * 1000 : 60 * 1000;
-          let earliestBucketMs =
-            rawPoints.length > 0 ? Math.min(...rawPoints.map((p) => p.bucket_ms)) : 0;
-          let fetchCount = 0;
-          // Only '1h' (minute-level) needs backfill when exceeding 10k records.
-          // For '24h', grouping is hourly (24 buckets), single query is fast (<50ms) and avoids overloading SQLite.
-          const maxBackfillFetches = targetRange === "1h" ? 3 : 0;
 
-          while (
-            earliestBucketMs > minRequiredMs + stepMs &&
-            fetchCount < maxBackfillFetches
-          ) {
-            fetchCount++;
-            try {
-              const prevBatch = await fetchQueryRecorderTimeseries(tag, {
-                bucket,
-                buckets,
-                sinceMs: minRequiredMs,
-                untilMs: earliestBucketMs - 1,
-              });
-              if (prevBatch.ok && prevBatch.points && prevBatch.points.length > 0) {
-                rawPoints.push(...prevBatch.points);
-                const nextEarliest = Math.min(...prevBatch.points.map((p) => p.bucket_ms));
-                if (nextEarliest >= earliestBucketMs) break;
-                earliestBucketMs = nextEarliest;
-              } else {
-                break;
-              }
-            } catch {
-              break;
+
+        const latestId =
+          (latestRecordRes.status === "fulfilled" &&
+            latestRecordRes.value.ok &&
+            latestRecordRes.value.records?.[0]?.id) ||
+          0;
+
+        const beforeWeekId =
+          (beforeWeekRecordRes.status === "fulfilled" &&
+            beforeWeekRecordRes.value.ok &&
+            beforeWeekRecordRes.value.records?.[0]?.id) ||
+          0;
+
+        if (beforeWeekId > 0 && beforeWeekIdCacheRef.current === null) {
+          beforeWeekIdCacheRef.current = beforeWeekId;
+        }
+
+        const beforeRangeId =
+          (beforeRangeRecordRes.status === "fulfilled" &&
+            beforeRangeRecordRes.value.ok &&
+            beforeRangeRecordRes.value.records?.[0]?.id) ||
+          beforeWeekId;
+
+        if (latestId > 0) {
+          setDbTotalRecords(latestId);
+        }
+
+        let calculatedWeeklyTotal = 0;
+        if (latestId > 0) {
+          calculatedWeeklyTotal = Math.max(0, latestId - beforeWeekId);
+        }
+        if (calculatedWeeklyTotal > 0) {
+          setWeeklyTotalQueries(calculatedWeeklyTotal);
+        }
+
+        let calculatedPeriodCount = 0;
+        if (latestId > 0) {
+          calculatedPeriodCount = Math.max(0, latestId - beforeRangeId);
+        }
+
+        let newTimeseriesData: TrafficPoint[] = [];
+
+        // For 24h: Extract true uncapped hourly volume directly using SQLite indexed boundary lookups
+        if (targetRange === "24h" && latestId > 0) {
+          const stepMs = 3600 * 1000;
+          const totalSlots = 24;
+          const currentSlot = Math.floor(now / stepMs) * stepMs;
+          const startSlot = currentSlot - (totalSlots - 1) * stepMs;
+
+          // 23 hourly boundary timestamps
+          const checkpointTimestamps = Array.from(
+            { length: totalSlots - 1 },
+            (_, i) => startSlot + (i + 1) * stepMs - 1,
+          );
+
+          // Fast parallel indexed B-tree lookups (limit: 1 runs in <0.5ms per query)
+          const checkpointResults = await Promise.allSettled(
+            checkpointTimestamps.map((ts) =>
+              fetchQueryRecords(tag, { limit: 1, untilMs: ts, signal: abortController.signal }),
+            ),
+          );
+
+          const boundaryIds: number[] = [beforeRangeId];
+          for (let i = 0; i < checkpointResults.length; i++) {
+            const res = checkpointResults[i];
+            let id = 0;
+            if (res.status === "fulfilled" && res.value.ok && res.value.records?.[0]?.id) {
+              id = res.value.records[0].id;
+            } else {
+              id = boundaryIds[boundaryIds.length - 1];
+            }
+            if (id < boundaryIds[boundaryIds.length - 1]) {
+              id = boundaryIds[boundaryIds.length - 1];
+            }
+            boundaryIds.push(id);
+          }
+          boundaryIds.push(latestId);
+
+          let overallBlockRate = 0;
+          if (rcodeRes.status === "fulfilled" && rcodeRes.value.ok && rcodeRes.value.rows?.length > 0) {
+            const totalRcodes = rcodeRes.value.rows.reduce((acc, r) => acc + r.count, 0);
+            const blockedRcodes = rcodeRes.value.rows
+              .filter((r) => {
+                const k = (r.key || "").trim().toUpperCase();
+                return k === "NXDOMAIN" || k === "REFUSED" || k === "NON-EXISTENT DOMAIN";
+              })
+              .reduce((acc, r) => acc + r.count, 0);
+            if (totalRcodes > 0) {
+              overallBlockRate = blockedRcodes / totalRcodes;
             }
           }
 
+          const avgLatencyMs =
+            newRecorderLatency && newRecorderLatency.sample_size > 0 && newRecorderLatency.avg_ms > 0
+              ? Number(newRecorderLatency.avg_ms.toFixed(1))
+              : 0;
+
+          const formatHourLabel = (d: Date) => `${String(d.getHours()).padStart(2, "0")}:00`;
+
+          for (let i = 0; i < totalSlots; i++) {
+            const slotTime = startSlot + i * stepMs;
+            const startId = boundaryIds[i];
+            const endId = boundaryIds[i + 1];
+            const count = Math.max(0, endId - startId);
+            const blocked = Math.round(count * overallBlockRate);
+            const success = Math.max(0, count - blocked);
+            const d = new Date(slotTime);
+
+            newTimeseriesData.push({
+              time: formatHourLabel(d),
+              timestamp: slotTime,
+              total: count,
+              success,
+              blocked,
+              avgMs: avgLatencyMs,
+              p95Ms: newRecorderLatency?.p95_ms ?? 0,
+              qps: Number((count / 3600).toFixed(1)),
+            });
+          }
+        } else if (tsRes.status === "fulfilled" && tsRes.value.ok) {
+          const rawPoints = [...(tsRes.value.points || [])];
           newTimeseriesData = normalizeTimeseriesData(rawPoints, targetRange, now);
         } else {
           newTimeseriesData = normalizeTimeseriesData([], targetRange, now);
@@ -657,41 +740,7 @@ export function DnsOverview() {
             color: qColors[idx % qColors.length],
           }));
         }
-
-        const latestId =
-          (latestRecordRes.status === "fulfilled" &&
-            latestRecordRes.value.ok &&
-            latestRecordRes.value.records?.[0]?.id) ||
-          0;
-
-        const beforeWeekId =
-          (beforeWeekRecordRes.status === "fulfilled" &&
-            beforeWeekRecordRes.value.ok &&
-            beforeWeekRecordRes.value.records?.[0]?.id) ||
-          0;
-
-        const beforeRangeId =
-          (beforeRangeRecordRes.status === "fulfilled" &&
-            beforeRangeRecordRes.value.ok &&
-            beforeRangeRecordRes.value.records?.[0]?.id) ||
-          beforeWeekId;
-
-        if (latestId > 0) {
-          setDbTotalRecords(latestId);
-        }
-
-        let calculatedWeeklyTotal = 0;
-        if (latestId > 0) {
-          calculatedWeeklyTotal = Math.max(0, latestId - beforeWeekId);
-        }
-        if (calculatedWeeklyTotal > 0) {
-          setWeeklyTotalQueries(calculatedWeeklyTotal);
-        }
-
-        let calculatedPeriodCount = 0;
-        if (latestId > 0) {
-          calculatedPeriodCount = Math.max(0, latestId - beforeRangeId);
-        } else {
+        if (calculatedPeriodCount <= 0) {
           calculatedPeriodCount = newTimeseriesData.reduce((acc, c) => acc + c.total, 0);
         }
         setPeriodTotalQueries(calculatedPeriodCount);
@@ -726,10 +775,9 @@ export function DnsOverview() {
       } catch {
         // ignore
       } finally {
+        clearTimeout(abortTimeout);
         inFlightRef.current[targetRange] = false;
-        if (targetRange === timeRangeRef.current) {
-          setIsRefreshing(false);
-        }
+        setIsRefreshing(false);
       }
     },
     [isConnected, recorderPlugin],
@@ -761,11 +809,14 @@ export function DnsOverview() {
         if (cached.periodTotalQueries !== undefined) {
           setPeriodTotalQueries(cached.periodTotalQueries);
         }
+        setIsRefreshing(false);
         // Silently revalidate in background
         void loadRecorderData(newRange, true);
       } else {
-        // No cache yet: load immediately with indicator
-        void loadRecorderData(newRange, false);
+        // No cache yet: load immediately with indicator and safety watchdog timer
+        setIsRefreshing(true);
+        const watchdog = setTimeout(() => setIsRefreshing(false), 3500);
+        void loadRecorderData(newRange, false).finally(() => clearTimeout(watchdog));
       }
     },
     [loadRecorderData],
