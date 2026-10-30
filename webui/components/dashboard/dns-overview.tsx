@@ -481,7 +481,41 @@ export function DnsOverview() {
 
         let newTimeseriesData: TrafficPoint[] = [];
         if (tsRes.status === "fulfilled" && tsRes.value.ok) {
-          const rawPoints = tsRes.value.points || [];
+          const rawPoints = [...(tsRes.value.points || [])];
+          // Pure frontend uncapped backfill: If database 1w sample limit caused earlier gap,
+          // fetch prior batches via untilMs until the entire requested range is filled
+          const minRequiredMs = sinceMs ?? rangeSinceMs;
+          const stepMs = targetRange === "24h" ? 3600 * 1000 : 60 * 1000;
+          let earliestBucketMs =
+            rawPoints.length > 0 ? Math.min(...rawPoints.map((p) => p.bucket_ms)) : 0;
+          let fetchCount = 0;
+          const maxBackfillFetches = 6; // allows pulling up to 70k+ detailed points seamlessly
+
+          while (
+            earliestBucketMs > minRequiredMs + stepMs &&
+            fetchCount < maxBackfillFetches
+          ) {
+            fetchCount++;
+            try {
+              const prevBatch = await fetchQueryRecorderTimeseries(tag, {
+                bucket,
+                buckets,
+                sinceMs: minRequiredMs,
+                untilMs: earliestBucketMs - 1,
+              });
+              if (prevBatch.ok && prevBatch.points && prevBatch.points.length > 0) {
+                rawPoints.push(...prevBatch.points);
+                const nextEarliest = Math.min(...prevBatch.points.map((p) => p.bucket_ms));
+                if (nextEarliest >= earliestBucketMs) break;
+                earliestBucketMs = nextEarliest;
+              } else {
+                break;
+              }
+            } catch {
+              break;
+            }
+          }
+
           newTimeseriesData = normalizeTimeseriesData(rawPoints, targetRange, now);
         } else {
           newTimeseriesData = normalizeTimeseriesData([], targetRange, now);
