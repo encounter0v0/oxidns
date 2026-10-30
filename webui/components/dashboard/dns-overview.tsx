@@ -257,6 +257,8 @@ export function DnsOverview() {
   const [timeRange, setTimeRange] = useState<TimeRange>("1h");
   const timeRangeRef = useRef<TimeRange>(timeRange);
   const dataCacheRef = useRef<Partial<Record<TimeRange, RangeCacheData>>>({});
+  const inFlightRef = useRef<Partial<Record<TimeRange, boolean>>>({});
+  const beforeWeekIdCacheRef = useRef<number | null>(null);
   const [isAutoRefresh, setIsAutoRefresh] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [activeDistTab, setActiveDistTab] = useState<"protocol" | "qtype">("protocol");
@@ -416,6 +418,15 @@ export function DnsOverview() {
         }
         return;
       }
+
+      if (inFlightRef.current[targetRange]) {
+        if (!isSilent && targetRange === timeRangeRef.current) {
+          setIsRefreshing(true);
+        }
+        return;
+      }
+      inFlightRef.current[targetRange] = true;
+
       try {
         if (!isSilent) {
           setIsRefreshing(true);
@@ -470,7 +481,9 @@ export function DnsOverview() {
           fetchQueryRecorderQtypeDistribution(tag, { sinceMs }),
           fetchQueryRecorderLatency(tag, { sinceMs }),
           fetchQueryRecords(tag, { limit: 1 }),
-          fetchQueryRecords(tag, { limit: 1, untilMs: startOfWeekMs - 1 }),
+          beforeWeekIdCacheRef.current !== null
+            ? Promise.resolve({ ok: true, records: [{ id: beforeWeekIdCacheRef.current }] as unknown as QueryRecordRow[] })
+            : fetchQueryRecords(tag, { limit: 1, untilMs: startOfWeekMs - 1 }),
           fetchQueryRecords(tag, { limit: 1, untilMs: rangeSinceMs - 1 }),
         ]);
 
@@ -489,7 +502,9 @@ export function DnsOverview() {
           let earliestBucketMs =
             rawPoints.length > 0 ? Math.min(...rawPoints.map((p) => p.bucket_ms)) : 0;
           let fetchCount = 0;
-          const maxBackfillFetches = 6; // allows pulling up to 70k+ detailed points seamlessly
+          // Only '1h' (minute-level) needs backfill when exceeding 10k records.
+          // For '24h', grouping is hourly (24 buckets), single query is fast (<50ms) and avoids overloading SQLite.
+          const maxBackfillFetches = targetRange === "1h" ? 3 : 0;
 
           while (
             earliestBucketMs > minRequiredMs + stepMs &&
@@ -711,6 +726,7 @@ export function DnsOverview() {
       } catch {
         // ignore
       } finally {
+        inFlightRef.current[targetRange] = false;
         if (targetRange === timeRangeRef.current) {
           setIsRefreshing(false);
         }
@@ -774,18 +790,26 @@ export function DnsOverview() {
     return () => clearInterval(interval);
   }, [isAutoRefresh, isConnected, recorderPlugin, loadRecorderData]);
 
-  // Prefetch adjacent time ranges quietly after initial load to make subsequent switches 0ms instant
+  // Stagger prefetch adjacent time ranges quietly after initial load so DB is never congested
   useEffect(() => {
     if (!isConnected || !recorderPlugin) return;
-    const timer = setTimeout(() => {
-      const ranges: TimeRange[] = ["1h", "24h", "live"];
-      ranges.forEach((r) => {
-        if (!dataCacheRef.current[r] && r !== timeRangeRef.current) {
-          void loadRecorderData(r, true);
-        }
-      });
-    }, 600);
-    return () => clearTimeout(timer);
+
+    const timerLive = setTimeout(() => {
+      if (!dataCacheRef.current["live"] && timeRangeRef.current !== "live") {
+        void loadRecorderData("live", true);
+      }
+    }, 1000);
+
+    const timer24h = setTimeout(() => {
+      if (!dataCacheRef.current["24h"] && timeRangeRef.current !== "24h") {
+        void loadRecorderData("24h", true);
+      }
+    }, 2200);
+
+    return () => {
+      clearTimeout(timerLive);
+      clearTimeout(timer24h);
+    };
   }, [isConnected, recorderPlugin, loadRecorderData]);
 
   // Derived KPI metrics
