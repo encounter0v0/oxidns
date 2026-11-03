@@ -1,3 +1,15 @@
+# OxiDNS v1.6.17
+
+## 🚀 发布概览
+
+**OxiDNS v1.6.17 前端增加24h数据库，用来统计和展示24h的数据，缓解后台取数压力，原来取数上10w后，数据载入较卡。**
+
+<img width="2549" height="1219" alt="image" src="https://github.com/user-attachments/assets/e486b576-5e66-4fa1-9dc2-8a2c302fb809" />
+
+
+
+
+
 # OxiDNS v1.6.8
 
 ## 🚀 发布概览
